@@ -1,0 +1,26 @@
+participant w1
+participant w2
+participant b1
+participant b2
+participant b3
+participant zk
+w1--xb1: e0
+w2->zk: mark as in recovery
+w2->b1: fence
+b1->w2: lac = -1
+w1->b2: e0
+b2->w1: e0 written
+w2->b2: fence
+b2->w2: lac = -1
+w2--xb3: fence
+note over w1,zk: fence success on 1 node per ack quorum\nlac is -1\nFenced: {b1,b2}, Entries: <<b1 :> {}, b2 :> {e0}, b3 :> {}>>
+w2->b1: read e0
+w2->b2: read e0
+w2->b3: read e0
+b1->w2: NoSuchEntry
+b3->w2: NoSuchEntry
+w2->zk: close ledger as empty
+w1->b3: write e0
+b3->w1: e0 written
+w1->w1: acknowledge e0\n to caller
+note over w1,zk: Acknowledged write e0 is effectively lost as it was truncated by metadata

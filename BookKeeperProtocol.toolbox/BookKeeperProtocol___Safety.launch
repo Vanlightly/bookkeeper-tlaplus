@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="org.lamport.tla.toolbox.tool.tlc.modelCheck">
+    <stringAttribute key="configurationName" value="Safety"/>
+    <intAttribute key="distributedFPSetCount" value="0"/>
+    <stringAttribute key="distributedNetworkInterface" value="10.127.57.224"/>
+    <intAttribute key="distributedNodesCount" value="1"/>
+    <stringAttribute key="distributedTLC" value="off"/>
+    <intAttribute key="maxHeapSize" value="25"/>
+    <stringAttribute key="modelBehaviorInit" value=""/>
+    <stringAttribute key="modelBehaviorNext" value=""/>
+    <stringAttribute key="modelBehaviorSpec" value="Spec"/>
+    <intAttribute key="modelBehaviorSpecType" value="1"/>
+    <stringAttribute key="modelBehaviorVars" value="meta_fragments, b_lac, messages, meta_last_entry, b_entries, meta_status, crashes, w1, w2, meta_version, b_fenced"/>
+    <stringAttribute key="modelComments" value=""/>
+    <booleanAttribute key="modelCorrectnessCheckDeadlock" value="false"/>
+    <listAttribute key="modelCorrectnessInvariants">
+        <listEntry value="1TypeOK"/>
+        <listEntry value="1OnlyValidFragments"/>
+        <listEntry value="1NoOutOfOrderEntries"/>
+        <listEntry value="1NoDivergenceBetweenWriterAndMetaData"/>
+        <listEntry value="1AllCommittedEntriesReachAckQuorum"/>
+    </listAttribute>
+    <listAttribute key="modelCorrectnessProperties"/>
+    <listAttribute key="modelParameterConstants">
+        <listEntry value="AddEntryResponseMessage;;AddEntryResponseMessage;1;0"/>
+        <listEntry value="ReadResponseMessage;;ReadResponseMessage;1;0"/>
+        <listEntry value="AllowCrashDuringReplication;;FALSE;0;0"/>
+        <listEntry value="AllowCrashDuringFencing;;FALSE;0;0"/>
+        <listEntry value="STATUS_IN_RECOVERY;;STATUS_IN_RECOVERY;1;0"/>
+        <listEntry value="SendLimit;;2;0;0"/>
+        <listEntry value="AckQuorum;;2;0;0"/>
+        <listEntry value="ReadRequestMessage;;ReadRequestMessage;1;0"/>
+        <listEntry value="RecoveryReadsFence;;TRUE;0;0"/>
+        <listEntry value="AddEntryRequestMessage;;AddEntryRequestMessage;1;0"/>
+        <listEntry value="Nil;;Nil;1;0"/>
+        <listEntry value="STATUS_OPEN;;STATUS_OPEN;1;0"/>
+        <listEntry value="STATUS_CLOSED;;STATUS_CLOSED;1;0"/>
+        <listEntry value="AllowCrashDuringRecoveryReads;;FALSE;0;0"/>
+        <listEntry value="FenceResponseMessage;;FenceResponseMessage;1;0"/>
+        <listEntry value="FenceRequestMessage;;FenceRequestMessage;1;0"/>
+        <listEntry value="STATUS_INVALID;;STATUS_INVALID;1;0"/>
+        <listEntry value="Bookies;;Bookies;1;0"/>
+        <listEntry value="WriteQuorum;;3;0;0"/>
+    </listAttribute>
+    <intAttribute key="modelVersion" value="20191005"/>
+    <intAttribute key="numberOfWorkers" value="8"/>
+    <stringAttribute key="result.mail.address" value=""/>
+    <stringAttribute key="specName" value="BookKeeperProtocol"/>
+    <stringAttribute key="tlcResourcesProfile" value="local custom"/>
+</launchConfiguration>
