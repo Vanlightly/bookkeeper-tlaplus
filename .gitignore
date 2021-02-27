@@ -1,0 +1,4 @@
+*.out
+states/
+*.jar
+detailed.log

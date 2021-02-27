@@ -26,9 +26,15 @@ An existing model called Safety is included which has parameters already configu
 ## Defects Found or Confirmed in December 2020 BookKeeper version 4.11
 
 ### Defect 1: Existing Fencing Not Enough to Prevent Data Loss
-Discovered by this TLA+ specification.
+Discovered by this TLA+ specification. The defect can be found with the following commands:
 
-The BookKeeper protocol defect found with this spec is that fencing of LAC reads is not enough to prevent committing an add:
+```bash
+wget https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+wget https://github.com/tlaplus/CommunityModules/releases/download/202102040137/CommunityModules.jar
+java -cp tla2tools.jar:CommunityModules.jar tlc2.TLC BookKeeperProtocol.tla -tool -modelcheck -deadlock -config BookKeeperProtocol.cfg -workers auto
+```
+
+In detail, the BookKeeper protocol defect found with this spec is that fencing of LAC reads is not enough to prevent committing an add:
 
 The below example involves the loss of a fencing request. However, the same is achievable if one fencing LAC req is delivered after a Recovery Read Req, for example due to some network delay and a connection failure between the requests.
 
