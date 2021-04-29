@@ -1,35 +1,30 @@
-------------------------- MODULE BookKeeperProtocolWithLimbo -------------------------
+------------------------- MODULE BookKeeperProtocol_v4-13 -------------------------
 EXTENDS MessagePassing, Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
 (*
-Represents proposed changes to make running BookKeeper without the journal safe (Kafka safety equivalent)
+This specification is refers to released version 4.13.
 
 See the readme for more information.
 *)
 
 \* Input parameters
-CONSTANTS Bookies,                        \* The bookies available e.g. { B1, B2, B3, B4 }
-          WriteQuorum,                    \* The replication factor under normal circumstances
-          AckQuorum,                      \* The number of bookies required to acknowledge an entry for the
-                                          \* writer to acknowledge to its own client, also the minimum
-                                          \* replication factor (can occur in scenarios such as ensemble change or ledger closes)
-          SendLimit,                      \* The data items to send. Limited to a very small number of data items
-                                          \* in order to keep the state space small. E.g 2
-          AllowCrashWhenLedgerOpen,       \* Allows a crash with data loss to occur when the ledger is open
-          AllowCrashWhenLedgerInRecovery, \* Allows a crash with data loss to occur when the ledger is in recovery
-          AllowCrashWhenLedgerClosed,     \* Allows a crash with data loss to occur when the ledger is closed
-          FenceOnUncleanShutdown,         \* On boot, when an unclean shutdown is detected, fence the ledger
-          SetLimboOnUncleanShutdown       \* On boot, when an unclean shutdown is detected, set limbo status on ledger 
+CONSTANTS Bookies,                      \* The bookies available e.g. { B1, B2, B3, B4 }
+          WriteQuorum,                  \* The replication factor under normal circumstances
+          AckQuorum,                    \* The number of bookies required to acknowledge an entry for the
+                                        \* writer to acknowledge to its own client, also the minimum
+                                        \* replication factor (can occur in scenarios such as ensemble change or ledger closes)
+          SendLimit,                    \* The data items to send. Limited to a very small number of data items
+                                        \* in order to keep the state space small. E.g 2
+          RecoveryReadsFence            \* TRUE|FALSE for whether recovery reads also fence.
+                                        \* Currently BK does not fence on recovery reads. See defects in readme.
 
 
 \* Model values
 CONSTANTS Nil,
-          NoSuchEntry,
-          Unknown,
-          OK,
           STATUS_OPEN,
           STATUS_IN_RECOVERY,
-          STATUS_CLOSED
+          STATUS_CLOSED,
+          STATUS_INVALID
 
 \* Ledger state in the metadata store
 VARIABLES meta_status,              \* the ledger status
@@ -39,34 +34,26 @@ VARIABLES meta_status,              \* the ledger status
 
 \* Bookie state (each is a function whose domain is the set of bookies) pertaining to this single ledger
 VARIABLES b_entries,                \* the entries stored in each bookie
-          b_fenced,                 \* the ledger fenced status of each bookie (TRUE/FALSE)
-          b_lac,                    \* the last add confirmed of each bookie
-          b_limbo                   \* the ledger limbo status of each bookie (TRUE/FALSE)
+          b_fenced,                 \* the fenced status of each bookie (TRUE/FALSE)
+          b_lac                     \* the last add confirmed of each bookie
 
 \* the state of the two writers
 VARIABLES w1,
           w2
 
-\* how many crashes have occurred (used to limit the number of crashes)
-VARIABLES crashes
-                   
 ASSUME SendLimit \in Nat
 ASSUME SendLimit > 0
+ASSUME RecoveryReadsFence \in BOOLEAN
 ASSUME WriteQuorum \in Nat
 ASSUME WriteQuorum > 0
 ASSUME AckQuorum \in Nat
 ASSUME AckQuorum > 0
 ASSUME WriteQuorum >= AckQuorum
-ASSUME AllowCrashWhenLedgerOpen \in BOOLEAN
-ASSUME AllowCrashWhenLedgerInRecovery \in BOOLEAN
-ASSUME AllowCrashWhenLedgerClosed \in BOOLEAN
-ASSUME FenceOnUncleanShutdown \in BOOLEAN
-ASSUME SetLimboOnUncleanShutdown \in BOOLEAN
 
 
-bookie_vars == << b_fenced, b_entries, b_lac, b_limbo >>
+bookie_vars == << b_fenced, b_entries, b_lac >>
 meta_vars == << meta_status, meta_fragments, meta_last_entry, meta_version >>
-vars == << bookie_vars, w1, w2, meta_vars, messages, crashes >>
+vars == << bookie_vars, w1, w2, meta_vars, messages >>
 
 (***************************************************************************)
 (* Recovery Phases                                                         *)
@@ -99,7 +86,7 @@ PendingAddOp ==
     [entry: Entry, fragment_id: Nat, ensemble: SUBSET Bookies]
 
 WriterStatuses ==
-    {Nil, STATUS_OPEN, STATUS_IN_RECOVERY, STATUS_CLOSED }
+    {Nil, STATUS_OPEN, STATUS_IN_RECOVERY, STATUS_CLOSED, STATUS_INVALID}
 
 WriterState ==
     [meta_version: Nat \union {Nil},            \* The metadata version this writer has
@@ -113,7 +100,6 @@ WriterState ==
      curr_read_entry: Entry \union {Nil},       \* The entry currently being read (during recovery)
      has_entry: SUBSET Bookies,                 \* Which bookies confirmed they have the current entry being read
      no_such_entry: SUBSET Bookies,             \* Which bookies confirmed they do not have the current entry being read
-     is_unknown: SUBSET Bookies,                \* Which bookies have responded saying they don't know if they have the current entry being read
      recovery_phase: 0..WritePhase]             \* The recovery phase (an artifical phase for reducing state space)
 
 \* Each writer starts empty, no state
@@ -129,7 +115,6 @@ InitWriter ==
      curr_read_entry |-> Nil,
      has_entry       |-> {},
      no_such_entry   |-> {},
-     is_unknown      |-> {},
      recovery_phase  |-> 0]
 
 (***************************************************************************)
@@ -188,7 +173,7 @@ W1CreatesLedger ==
         /\ meta_status' = STATUS_OPEN
         /\ meta_version' = 1
         /\ meta_fragments' = Append(meta_fragments, fragment)
-    /\ UNCHANGED << bookie_vars, w2, meta_last_entry, messages, crashes >>
+    /\ UNCHANGED << bookie_vars, w2, meta_last_entry, messages >>
 
 (***************************************************************************)
 (* ACTION: Send Add Entry Requests for a given data item                   *)
@@ -221,7 +206,7 @@ W1SendsAddEntryRequests ==
        IN
         /\ entry_data <= SendLimit
         /\ SendAddEntryRequests([id   |-> entry_data, data |-> entry_data])
-    /\ UNCHANGED << bookie_vars, w2, meta_vars, crashes >>
+    /\ UNCHANGED << bookie_vars, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive an AddEntryRequestMessage, Send a confirm               *)
@@ -247,7 +232,7 @@ BookieSendsAddConfirmedResponse ==
         /\ b_entries' = [b_entries EXCEPT ![msg.bookie] = @ \union {msg.entry}]
         /\ b_lac' = [b_lac EXCEPT ![msg.bookie] = msg.lac]
         /\ ProcessedOneAndSendAnother(msg, GetAddEntryResponse(msg, TRUE))
-        /\ UNCHANGED << b_fenced, b_limbo, w1, w2, meta_vars, crashes >>
+        /\ UNCHANGED << b_fenced, w1, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive an AddEntryRequestMessage, Send a fenced response       *)
@@ -264,7 +249,7 @@ BookieSendsAddFencedResponse ==
         /\ b_fenced[msg.bookie] = TRUE
         /\ IsEarliestMsg(msg)
         /\ ProcessedOneAndSendAnother(msg, GetAddEntryResponse(msg, FALSE))
-        /\ UNCHANGED << bookie_vars, w1, w2, meta_vars, crashes >>
+        /\ UNCHANGED << bookie_vars, w1, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive a success AddEntryResponseMessage                       *)
@@ -318,12 +303,12 @@ ReceiveAddConfirmedResponse(writer, is_recovery) ==
 W1ReceivesAddConfirmedResponse ==
     /\ w1.status = STATUS_OPEN
     /\ ReceiveAddConfirmedResponse(w1, FALSE)
-    /\ UNCHANGED << bookie_vars, w2, meta_vars, crashes >>
+    /\ UNCHANGED << bookie_vars, w2, meta_vars >>
 
 W2ReceivesAddConfirmedResponse ==
     /\ w2.status = STATUS_IN_RECOVERY
     /\ ReceiveAddConfirmedResponse(w2, TRUE)
-    /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+    /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive a fenced AddEntryResponseMessage                        *)
@@ -347,7 +332,7 @@ W1ReceivesAddFencedResponse ==
         /\ msg.bookie \in w1.curr_fragment.ensemble
         /\ w1' = [w1 EXCEPT !.status = Nil]
         /\ MessageProcessed(msg)
-        /\ UNCHANGED << bookie_vars, w2, meta_vars, crashes >>
+        /\ UNCHANGED << bookie_vars, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Change Ensemble                                                 *)
@@ -416,13 +401,43 @@ W1ChangesEnsemble ==
     /\ w1.status = STATUS_OPEN
     /\ meta_status = STATUS_OPEN
     /\ ChangeEnsemble(w1, FALSE)
-    /\ UNCHANGED <<  bookie_vars, w2, meta_status, meta_last_entry, crashes >>
+    /\ UNCHANGED <<  bookie_vars, w2, meta_status, meta_last_entry >>
 
 W2ChangesEnsemble ==
     /\ w2.status = STATUS_IN_RECOVERY
     /\ meta_status = STATUS_IN_RECOVERY
     /\ ChangeEnsemble(w2, TRUE)
-    /\ UNCHANGED <<  bookie_vars, w1, meta_status, meta_last_entry, crashes >>
+    /\ UNCHANGED <<  bookie_vars, w1, meta_status, meta_last_entry >>
+
+(***************************************************************************)
+(* ACTION: Invalid Ensemble Change                                         *)
+(* BY: writer1 or writer 2                                                 *)
+(*                                                                         *)
+(* An ensemble change is triggered but the first entry id is lower than an *)
+(* existing ensemble, which is an invalid change not permitted by the      *)
+(* protocol.                                                               *)
+(***************************************************************************)
+
+InvalidEnsembleChange(writer, recovery) ==
+    /\ NoPendingResends(writer)
+    /\ writer.meta_version = meta_version
+    /\ \E bookie \in writer.curr_fragment.ensemble :
+        /\ WriteTimeoutForBookie(messages, bookie, recovery)
+        /\ EnsembleAvailable(writer.curr_fragment.ensemble \ {bookie}, {bookie})
+        /\ ~ValidNextFragment(writer.lac + 1)
+        /\ writer' = [writer EXCEPT !.status = STATUS_INVALID]
+
+W1TriesInvalidEnsembleChange ==
+    /\ w1.status = STATUS_OPEN
+    /\ meta_status = STATUS_OPEN
+    /\ InvalidEnsembleChange(w1, FALSE)
+    /\ UNCHANGED <<  bookie_vars, w2, meta_vars, messages >>
+
+W2TriesInvalidEnsembleChange ==
+    /\ w2.status = STATUS_IN_RECOVERY
+    /\ meta_status = STATUS_IN_RECOVERY
+    /\ InvalidEnsembleChange(w2, TRUE)
+    /\ UNCHANGED <<  bookie_vars, w1, meta_vars, messages >>
 
 (***************************************************************************)
 (* ACTION: Send Pending Add Op                                             *)
@@ -469,12 +484,12 @@ SendPendingAddOp(writer, is_recovery) ==
 W1SendsPendingAddOp ==
     /\ w1.status = STATUS_OPEN
     /\ SendPendingAddOp(w1, FALSE)
-    /\ UNCHANGED << bookie_vars, w2, meta_vars, crashes >>
+    /\ UNCHANGED << bookie_vars, w2, meta_vars >>
 
 W2SendsPendingAddOp ==
     /\ w2.status = STATUS_IN_RECOVERY
     /\ SendPendingAddOp(w2, TRUE)
-    /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+    /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Close the ledger                                                *)
@@ -494,7 +509,7 @@ W1CloseLedgerSuccess ==
     /\ meta_status' = STATUS_CLOSED
     /\ meta_last_entry' = w1.lac
     /\ meta_version' = meta_version + 1
-    /\ UNCHANGED << bookie_vars, w2, meta_fragments, messages, crashes >>
+    /\ UNCHANGED << bookie_vars, w2, meta_fragments, messages >>
 
 (***************************************************************************)
 (* ACTION: Closing the ledger fails                                        *)
@@ -510,7 +525,7 @@ W1CloseLedgerFail ==
     /\ w1.status = STATUS_OPEN
     /\ meta_status # STATUS_OPEN
     /\ w1' = [w1 EXCEPT !.meta_version = Nil]
-    /\ UNCHANGED << bookie_vars, w2, meta_vars, messages, crashes >>
+    /\ UNCHANGED << bookie_vars, w2, meta_vars, messages >>
 
 (***************************************************************************)
 (* ACTION: Start ledger recovery                                           *)
@@ -538,7 +553,7 @@ W2PlaceInRecovery ==
                         !.recovery_phase = FencingPhase,
                         !.curr_fragment  = CurrentFragment]
     /\ SendMessagesToEnsemble(GetFencedReadLacRequests(CurrentFragment.ensemble))
-    /\ UNCHANGED << bookie_vars, w1, meta_fragments, meta_last_entry, crashes >>
+    /\ UNCHANGED << bookie_vars, w1, meta_fragments, meta_last_entry >>
 
 (***************************************************************************)
 (* ACTION: Receive a fence request, send a response                        *)
@@ -559,7 +574,7 @@ BookieSendsFencingReadLacResponse ==
         /\ ReceivableMessageOfType(messages, msg, FenceRequestMessage)
         /\ b_fenced' = [b_fenced EXCEPT ![msg.bookie] = TRUE]
         /\ ProcessedOneAndSendAnother(msg, GetFencingReadLacResponseMessage(msg))
-        /\ UNCHANGED << b_entries, b_lac, b_limbo, w1, w2, meta_vars, crashes >>
+        /\ UNCHANGED << b_entries, b_lac, w1, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive a fence response                                        *)
@@ -590,7 +605,7 @@ W2ReceivesFencingReadLacResponse ==
                                         THEN lac
                                         ELSE @]
             /\ MessageProcessed(msg)
-            /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+            /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Send a recovery read request to each bookie                     *)
@@ -613,7 +628,7 @@ GetRecoveryReadRequests(entry_id, ensemble) ==
     { [type     |-> ReadRequestMessage,
        bookie   |-> b,
        entry_id |-> entry_id,
-       fence    |-> TRUE] : b \in ensemble }
+       fence    |-> RecoveryReadsFence] : b \in ensemble }
 
 W2SendsReadRequests ==
     /\ w2.status = STATUS_IN_RECOVERY
@@ -626,7 +641,7 @@ W2SendsReadRequests ==
         /\ NotSentRead(next_entry_id)
         /\ w2' = [w2 EXCEPT !.recovery_phase = PendingReadResponsePhase]
         /\ SendMessagesToEnsemble(GetRecoveryReadRequests(next_entry_id, FragmentOfEntryId(next_entry_id).ensemble))
-        /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+        /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive a read request, send a response                         *)
@@ -645,12 +660,7 @@ GetReadResponseMessage(msg) ==
      entry    |-> IF \E entry \in b_entries[msg.bookie] : entry.id = msg.entry_id
                   THEN CHOOSE entry \in b_entries[msg.bookie] : entry.id = msg.entry_id
                   ELSE Nil,
-     fence    |-> msg.fence,
-     code     |-> IF \E entry \in b_entries[msg.bookie] : entry.id = msg.entry_id
-                  THEN OK
-                  ELSE IF b_limbo[msg.bookie] = TRUE
-                       THEN Unknown
-                       ELSE NoSuchEntry]
+     fence    |-> msg.fence]
 
 BookieSendsReadResponse ==
     \E msg \in DOMAIN messages :
@@ -659,23 +669,19 @@ BookieSendsReadResponse ==
            THEN b_fenced' = [b_fenced EXCEPT ![msg.bookie] = TRUE]
            ELSE UNCHANGED b_fenced
         /\ ProcessedOneAndSendAnother(msg, GetReadResponseMessage(msg))
-        /\ UNCHANGED << b_entries, b_lac, b_limbo, w1, w2, meta_vars, crashes >>
+        /\ UNCHANGED << b_entries, b_lac, w1, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Receive a non final read response                               *)
 (* BY: writer 2                                                            *)
 (*                                                                         *)
-(* The second writer receives either a success ReadResponseMessage,        *)
-(* a NoSuchEntry or if limbo status is activated, then Unknown.            *)
-(* This action occurs when there are still more responses pending          *)
-(* (including timeouts).                                                   *)
+(* The second writer receives either a success ReadResponseMessage         *)
+(* or a NoSuchEntry (entry=Nil). This action occurs when there are still   *)
+(* more responses pending (including timeouts).                            *)
 (***************************************************************************)
 
-ReceivedAllResponses(has_entry, no_such_entry, is_unknown, ensemble) ==
-    Cardinality(has_entry) 
-    + Cardinality(no_such_entry)
-    + Cardinality(is_unknown)  
-    + ReadTimeoutCount(ensemble, TRUE) = WriteQuorum
+ReceivedAllResponses(has_entry, no_such_entry, ensemble) ==
+    Cardinality(has_entry) + Cardinality(no_such_entry) + ReadTimeoutCount(ensemble, TRUE) = WriteQuorum
 
 NotEnoughBookies(no_such_entry) ==
     Cardinality(no_such_entry) >= (WriteQuorum - AckQuorum) + 1
@@ -683,14 +689,14 @@ NotEnoughBookies(no_such_entry) ==
 EnoughBookies(has_entry) ==
     Cardinality(has_entry) >= AckQuorum
 
-ReadSuccess(read_ensemble, has_entry, no_such_entry, is_unknown) ==
-   IF /\ ReceivedAllResponses(has_entry, no_such_entry, is_unknown, read_ensemble)
+ReadSuccess(read_ensemble, has_entry, no_such_entry) ==
+   IF /\ ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
       /\ EnoughBookies(has_entry)
    THEN TRUE
    ELSE FALSE
 
-ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry, is_unknown) ==
-    IF /\ ReceivedAllResponses(has_entry, no_such_entry, is_unknown, read_ensemble)
+ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry) ==
+    IF /\ ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
        /\ NotEnoughBookies(no_such_entry)
     THEN TRUE
     ELSE FALSE
@@ -698,18 +704,16 @@ ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry, is_unknown) ==
 W2ReceivesNonFinalRead ==
     \E msg \in DOMAIN messages :
         /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-        /\ LET read_ensemble == IF msg.code = OK THEN FragmentOfEntryId(msg.entry.id).ensemble ELSE {}
-               has_entry     == IF msg.code = OK THEN w2.has_entry \union {msg.bookie} ELSE w2.has_entry
-               no_such_entry == IF msg.code = NoSuchEntry THEN w2.no_such_entry \union {msg.bookie} ELSE w2.no_such_entry
-               is_unknown    == IF msg.code = Unknown THEN w2.is_unknown \union {msg.bookie} ELSE w2.is_unknown
-           IN /\ ~ReceivedAllResponses(has_entry, no_such_entry, is_unknown, read_ensemble)
+        /\ LET read_ensemble == IF msg.entry # Nil THEN FragmentOfEntryId(msg.entry.id).ensemble ELSE {}
+               has_entry     == IF msg.entry # Nil THEN w2.has_entry \union {msg.bookie} ELSE w2.has_entry
+               no_such_entry == IF msg.entry = Nil THEN w2.no_such_entry \union {msg.bookie} ELSE w2.no_such_entry
+           IN /\ ~ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
               /\ w2' = [w2 EXCEPT !.has_entry       = has_entry,
                                   !.no_such_entry   = no_such_entry,
-                                  !.is_unknown      = is_unknown,
-                                  !.curr_read_entry = IF msg.code = OK THEN msg.entry ELSE @,
+                                  !.curr_read_entry = IF msg.entry # Nil THEN msg.entry ELSE @,
                                   !.fenced          = IF msg.fence = TRUE THEN @ \union {msg.bookie} ELSE @]
               /\ MessageProcessed(msg)
-        /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+        /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: A read completes successfullly.                                 *)
@@ -723,16 +727,14 @@ W2ReceivesNonFinalRead ==
 W2CompletesReadSuccessfully ==
     \E msg \in DOMAIN messages :
         /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-        /\ LET read_ensemble == IF msg.code = OK THEN FragmentOfEntryId(msg.entry.id).ensemble ELSE {}
-               has_entry     == IF msg.code = OK THEN w2.has_entry \union {msg.bookie} ELSE w2.has_entry
-               no_such_entry == IF msg.code = NoSuchEntry THEN w2.no_such_entry \union {msg.bookie} ELSE w2.no_such_entry
-               is_unknown    == IF msg.code = Unknown THEN w2.is_unknown \union {msg.bookie} ELSE w2.is_unknown
-           IN /\ ReadSuccess(read_ensemble, has_entry, no_such_entry, is_unknown)
+        /\ LET read_ensemble == IF msg.entry # Nil THEN FragmentOfEntryId(msg.entry.id).ensemble ELSE {}
+               has_entry     == IF msg.entry # Nil THEN w2.has_entry \union {msg.bookie} ELSE w2.has_entry
+               no_such_entry == IF msg.entry = Nil THEN w2.no_such_entry \union {msg.bookie} ELSE w2.no_such_entry
+           IN /\ ReadSuccess(read_ensemble, has_entry, no_such_entry)
               /\ LET entry_data == IF msg.entry = Nil THEN w2.curr_read_entry.data ELSE msg.entry.data
                  IN
                   /\ w2' = [w2 EXCEPT !.has_entry       = {}, \* reset for next read
                                       !.no_such_entry   = {}, \* reset for next read
-                                      !.is_unknown      = {}, \* reset for next read
                                       !.curr_read_entry = Nil, \* reset for next read
                                       !.fenced          = IF msg.fence = TRUE THEN @ \union {msg.bookie} ELSE @,
                                       !.lap             = @ + 1,
@@ -742,7 +744,7 @@ W2CompletesReadSuccessfully ==
                                                                      ensemble    |-> w2.curr_fragment.ensemble]},
                                       !.recovery_phase  = ReadPhase]
               /\ ClearReadTimeouts(msg, read_ensemble)
-        /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+        /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: A read completes with NoSuchEntry/Ledger.                       *)
@@ -761,22 +763,20 @@ W2CompletesReadSuccessfully ==
 W2CompletesReadWithNoSuchEntry ==
     \E msg \in DOMAIN messages :
         /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-        /\ LET read_ensemble == IF msg.code = OK THEN FragmentOfEntryId(msg.entry.id).ensemble ELSE {}
-               has_entry     == IF msg.code = OK THEN w2.has_entry \union {msg.bookie} ELSE w2.has_entry
-               no_such_entry == IF msg.code = NoSuchEntry THEN w2.no_such_entry \union {msg.bookie} ELSE w2.no_such_entry
-               is_unknown    == IF msg.code = Unknown THEN w2.is_unknown \union {msg.bookie} ELSE w2.is_unknown
+        /\ LET read_ensemble == IF msg.entry # Nil THEN FragmentOfEntryId(msg.entry.id).ensemble ELSE {}
+               has_entry     == IF msg.entry # Nil THEN w2.has_entry \union {msg.bookie} ELSE w2.has_entry
+               no_such_entry == IF msg.entry = Nil THEN w2.no_such_entry \union {msg.bookie} ELSE w2.no_such_entry
            IN
-              /\ ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry, is_unknown)
+              /\ ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry)
               /\ w2' = [w2 EXCEPT !.has_entry       = {}, \* reset to reduce state space
                                   !.no_such_entry   = {}, \* reset to reduce state space
-                                  !.is_unknown      = {}, \* reset to reduce state space
                                   !.curr_read_entry = Nil, \* reset to reduce state space
                                   !.fenced          = IF msg.fence = TRUE
                                                       THEN @ \union {msg.bookie}
                                                       ELSE @,
                                   !.recovery_phase  = WritePhase]
               /\ ClearReadTimeouts(msg, read_ensemble)
-        /\ UNCHANGED << bookie_vars, w1, meta_vars, crashes >>
+        /\ UNCHANGED << bookie_vars, w1, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Write back a entry that was successfully read.                  *)
@@ -805,7 +805,7 @@ W2WritesBackEntry ==
                                                       op.entry,
                                                       w2.curr_fragment.ensemble,
                                                       TRUE))
-   /\ UNCHANGED << bookie_vars, w1, w2, meta_vars, crashes >>
+   /\ UNCHANGED << bookie_vars, w1, w2, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: Close the ledger upon successfully completing all writes.       *)
@@ -829,58 +829,7 @@ W2ClosesLedger ==
     /\ meta_version' = meta_version + 1
     /\ meta_status' = STATUS_CLOSED
     /\ meta_last_entry' = w2.lac
-    /\ UNCHANGED << bookie_vars, w1, meta_fragments, messages, crashes >>
-    
-(***************************************************************************)
-(* ACTION: Bookie loses all data, starts empty                             *)
-(* BY: a bookie                                                            *)
-(*                                                                         *)
-(* A bookie crashes, comes back up with all data gone.                     *)
-(* Three variants are availble:                                            *)
-(* - outside of a recovery process                                         *)
-(* - during fencing                                                        *)
-(* - during recovery read phase                                            *)
-(*                                                                         *)
-(* These variants provide tunable failure scenarios when running TLC.      *)
-(* Currently limited to a single crash.                                    *)
-(***************************************************************************)
-
-BookieRestartsWithDataLoss ==
-    /\ \E b \in Bookies :
-        /\ b_entries' = [b_entries EXCEPT ![b] = {}]
-        /\ b_lac' = [b_lac EXCEPT ![b] = 0]
-        /\ crashes' = crashes + 1
-        /\ messages' = [msg \in DOMAIN messages |-> IF /\ msg.type \in {AddEntryRequestMessage, FenceRequestMessage, ReadRequestMessage}
-                                                       /\ msg.bookie = b
-                                                       /\ messages[msg] = 1
-                                                    THEN -1
-                                                    ELSE messages[msg]]
-        /\ IF SetLimboOnUncleanShutdown
-           THEN b_limbo' = [b_limbo EXCEPT ![b] = TRUE]
-           ELSE UNCHANGED b_limbo
-        /\ IF FenceOnUncleanShutdown
-           THEN b_fenced' = [b_fenced EXCEPT ![b] = TRUE]
-           ELSE \* the fenced status is lost along with the entries
-                b_fenced' = [b_fenced EXCEPT ![b] = FALSE]    
-        /\ UNCHANGED << w1, w2, meta_vars >>
-    
-BookieCrashesWhenLedgerOpen ==
-    /\ AllowCrashWhenLedgerOpen
-    /\ crashes = 0
-    /\ meta_status = STATUS_OPEN
-    /\ BookieRestartsWithDataLoss
-
-BookieCrashesWhenLedgerInRecovery ==
-    /\ AllowCrashWhenLedgerInRecovery
-    /\ crashes = 0
-    /\ meta_status = STATUS_IN_RECOVERY
-    /\ BookieRestartsWithDataLoss
-
-BookieCrashesWhenLedgerClosed ==
-    /\ AllowCrashWhenLedgerClosed
-    /\ crashes = 0
-    /\ meta_status = STATUS_CLOSED
-    /\ BookieRestartsWithDataLoss
+    /\ UNCHANGED << bookie_vars, w1, meta_fragments, messages >>
 
 (***************************************************************************)
 (* Initial and Next state                                                  *)
@@ -895,10 +844,8 @@ Init ==
     /\ b_fenced = [b \in Bookies |-> FALSE]
     /\ b_entries = [b \in Bookies |-> {}]
     /\ b_lac = [b \in Bookies |-> 0]
-    /\ b_limbo = [b \in Bookies |-> FALSE]
     /\ w1 = InitWriter
     /\ w2 = InitWriter
-    /\ crashes = 0
 
 Next ==
     \* Bookies
@@ -906,15 +853,13 @@ Next ==
     \/ BookieSendsAddFencedResponse
     \/ BookieSendsFencingReadLacResponse
     \/ BookieSendsReadResponse
-    \/ BookieCrashesWhenLedgerOpen
-    \/ BookieCrashesWhenLedgerInRecovery
-    \/ BookieCrashesWhenLedgerClosed
     \* W1
     \/ W1CreatesLedger
     \/ W1SendsAddEntryRequests
     \/ W1ReceivesAddConfirmedResponse
     \/ W1ReceivesAddFencedResponse
     \/ W1ChangesEnsemble
+    \/ W1TriesInvalidEnsembleChange
     \/ W1SendsPendingAddOp
     \/ W1CloseLedgerSuccess
     \/ W1CloseLedgerFail
@@ -928,6 +873,7 @@ Next ==
     \/ W2WritesBackEntry
     \/ W2ReceivesAddConfirmedResponse
     \/ W2ChangesEnsemble
+    \/ W2TriesInvalidEnsembleChange
     \/ W2SendsPendingAddOp
     \/ W2ClosesLedger
 
@@ -984,6 +930,17 @@ AllCommittedEntriesReachAckQuorum ==
          ELSE TRUE
 
 (***************************************************************************)
+(* Invariant: New fragments cannot have a lower first entry id than any    *)
+(*            existing fragment.                                           *)
+(*                                                                         *)
+(* This invariant is violated when a writer goes to add a fragment to the  *)
+(* metadata store that is invalid.                                         *)
+(***************************************************************************)
+OnlyValidFragments ==
+    /\ w1.status # STATUS_INVALID
+    /\ w2.status # STATUS_INVALID
+
+(***************************************************************************)
 (* Invariant: Entries must be stored in the same order the writer sent     *)
 (*            them.                                                        *)
 (*                                                                         *)
@@ -1015,4 +972,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Apr 29 16:31:34 CET 2021 by jvanlightly
+\* Last modified Tue Dec 01 13:57:30 CET 2020 by jvanlightly
+\* Created Tue Nov 10 13:36:16 CET 2020 by jvanlightly

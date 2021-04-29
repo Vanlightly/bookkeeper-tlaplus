@@ -2,6 +2,8 @@
 EXTENDS MessagePassing, Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
 (*
+Represents master branch (aspirational). Models only the lifetime of a single ledger.
+
 See the readme for more information.
 *)
 
@@ -11,18 +13,14 @@ CONSTANTS Bookies,                      \* The bookies available e.g. { B1, B2, 
           AckQuorum,                    \* The number of bookies required to acknowledge an entry for the
                                         \* writer to acknowledge to its own client, also the minimum
                                         \* replication factor (can occur in scenarios such as ensemble change or ledger closes)
-          SendLimit,                    \* The data items to send. Limited to a very small number of data items
+          SendLimit                     \* The data items to send. Limited to a very small number of data items
                                         \* in order to keep the state space small. E.g 2
-          RecoveryReadsFence            \* TRUE|FALSE for whether recovery reads also fence.
-                                        \* Currently BK does not fence on recovery reads. See defects in readme.
-
 
 \* Model values
 CONSTANTS Nil,
           STATUS_OPEN,
           STATUS_IN_RECOVERY,
-          STATUS_CLOSED,
-          STATUS_INVALID
+          STATUS_CLOSED
 
 \* Ledger state in the metadata store
 VARIABLES meta_status,              \* the ledger status
@@ -41,7 +39,6 @@ VARIABLES w1,
 
 ASSUME SendLimit \in Nat
 ASSUME SendLimit > 0
-ASSUME RecoveryReadsFence \in BOOLEAN
 ASSUME WriteQuorum \in Nat
 ASSUME WriteQuorum > 0
 ASSUME AckQuorum \in Nat
@@ -81,10 +78,10 @@ Fragment ==
     [id: Nat, ensemble: SUBSET Bookies, first_entry_id: Nat]
 
 PendingAddOp ==
-    [entry: Entry, fragment_id: Nat]
+    [entry: Entry, fragment_id: Nat, ensemble: SUBSET Bookies]
 
 WriterStatuses ==
-    {Nil, STATUS_OPEN, STATUS_IN_RECOVERY, STATUS_CLOSED, STATUS_INVALID}
+    {Nil, STATUS_OPEN, STATUS_IN_RECOVERY, STATUS_CLOSED}
 
 WriterState ==
     [meta_version: Nat \union {Nil},            \* The metadata version this writer has
@@ -195,7 +192,8 @@ SendAddEntryRequests(entry) ==
                                                   FALSE))
     /\ w1' = [w1 EXCEPT !.lap = entry.id,
                         !.pending_add_ops = @ \union {[entry       |-> entry,
-                                                       fragment_id |-> w1.curr_fragment.id]}]
+                                                       fragment_id |-> w1.curr_fragment.id,
+                                                       ensemble    |-> w1.curr_fragment.ensemble]}]
 
 W1SendsAddEntryRequests ==
     /\ w1.status = STATUS_OPEN
@@ -355,13 +353,14 @@ W1ReceivesAddFencedResponse ==
 
 NoPendingResends(writer) ==
     ~\E op \in writer.pending_add_ops :
-        /\ op.fragment_id # writer.curr_fragment.id
+        /\ \/ op.fragment_id # writer.curr_fragment.id
+           \/ op.ensemble # writer.curr_fragment.ensemble
 
 \* The next fragment is only valid if it's first_entry_id is equal to or higher than all existing fragments.
 ValidNextFragment(first_entry_id) ==
     ~\E i \in DOMAIN meta_fragments : meta_fragments[i].first_entry_id > first_entry_id
 
-\* if there already exists an ensemble with the same first_entry_id the replace it,
+\* if there already exists an ensemble with the same first_entry_id then replace it,
 \* else append a new fragment
 UpdatedFragments(writer, first_entry_id, new_ensemble) ==
     IF first_entry_id = writer.curr_fragment.first_entry_id
@@ -406,58 +405,40 @@ W2ChangesEnsemble ==
     /\ UNCHANGED <<  bookie_vars, w1, meta_status, meta_last_entry >>
 
 (***************************************************************************)
-(* ACTION: Invalid Ensemble Change                                         *)
-(* BY: writer1 or writer 2                                                 *)
-(*                                                                         *)
-(* An ensemble change is triggered but the first entry id is lower than an *)
-(* existing ensemble, which is an invalid change not permitted by the      *)
-(* protocol.                                                               *)
-(***************************************************************************)
-
-InvalidEnsembleChange(writer, recovery) ==
-    /\ NoPendingResends(writer)
-    /\ writer.meta_version = meta_version
-    /\ \E bookie \in writer.curr_fragment.ensemble :
-        /\ WriteTimeoutForBookie(messages, bookie, recovery)
-        /\ EnsembleAvailable(writer.curr_fragment.ensemble \ {bookie}, {bookie})
-        /\ ~ValidNextFragment(writer.lac + 1)
-        /\ writer' = [writer EXCEPT !.status = STATUS_INVALID]
-
-W1TriesInvalidEnsembleChange ==
-    /\ w1.status = STATUS_OPEN
-    /\ meta_status = STATUS_OPEN
-    /\ InvalidEnsembleChange(w1, FALSE)
-    /\ UNCHANGED <<  bookie_vars, w2, meta_vars, messages >>
-
-W2TriesInvalidEnsembleChange ==
-    /\ w2.status = STATUS_IN_RECOVERY
-    /\ meta_status = STATUS_IN_RECOVERY
-    /\ InvalidEnsembleChange(w2, TRUE)
-    /\ UNCHANGED <<  bookie_vars, w1, meta_vars, messages >>
-
-(***************************************************************************)
 (* ACTION: Send Pending Add Op                                             *)
 (* BY: writer1 or writer 2                                                 *)
 (*                                                                         *)
 (* A pending add op needs to be sent to one or more bookies of a           *)
 (* new ensemble due to a previous bookie write failure.                    *)
+(* We resend a pending add op when it has a different fragment id          *) 
+(* or different ensemble the current fragment (basically the op was not    *)
+(* updated yet with the ensemble change.                                   *)  
+(* The ensemble change may have been a replacement rather than appended    *)
+(* so the id may be the same but the ensemble different, hence checking    *)
+(* both.                                                                   *)
 (***************************************************************************)
 
+\* update the pending add op ensemble
 SetNewEnsemble(writer, pending_op) ==
     {
         IF op = pending_op
         THEN [entry       |-> op.entry,
-              fragment_id |-> writer.curr_fragment.id]
+              fragment_id |-> writer.curr_fragment.id,
+              ensemble    |-> writer.curr_fragment.ensemble]
         ELSE op : op \in writer.pending_add_ops
     }
 
+\* send the add to any bookies in the new ensemble that are not in the original
+\* then update the op with the new ensemble.
 SendPendingAddOp(writer, is_recovery) ==
     /\ \E op \in writer.pending_add_ops :
-        /\ op.fragment_id # writer.curr_fragment.id
+        /\ \/ op.fragment_id # writer.curr_fragment.id
+           \/ op.ensemble # writer.curr_fragment.ensemble
         /\ ~\E op2 \in writer.pending_add_ops :
             /\ op2.fragment_id = op.fragment_id
+            /\ op2.ensemble = op.ensemble
             /\ op2.entry.id < op.entry.id
-        /\ LET new_bookies == writer.curr_fragment.ensemble \ FragmentOf(op.fragment_id).ensemble
+        /\ LET new_bookies == writer.curr_fragment.ensemble \ op.ensemble
            IN
               /\ SendMessagesToEnsemble(GetAddEntryRequests(writer,
                                                             op.entry,
@@ -612,7 +593,7 @@ GetRecoveryReadRequests(entry_id, ensemble) ==
     { [type     |-> ReadRequestMessage,
        bookie   |-> b,
        entry_id |-> entry_id,
-       fence    |-> RecoveryReadsFence] : b \in ensemble }
+       fence    |-> TRUE] : b \in ensemble }
 
 W2SendsReadRequests ==
     /\ w2.status = STATUS_IN_RECOVERY
@@ -670,12 +651,12 @@ ReceivedAllResponses(has_entry, no_such_entry, ensemble) ==
 NotEnoughBookies(no_such_entry) ==
     Cardinality(no_such_entry) >= (WriteQuorum - AckQuorum) + 1
 
-EnoughBookies(no_such_entry) ==
-    ~NotEnoughBookies(no_such_entry)
+EnoughBookies(has_entry) ==
+    Cardinality(has_entry) >= AckQuorum
 
 ReadSuccess(read_ensemble, has_entry, no_such_entry) ==
    IF /\ ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
-      /\ EnoughBookies(no_such_entry)
+      /\ EnoughBookies(has_entry)
    THEN TRUE
    ELSE FALSE
 
@@ -724,7 +705,8 @@ W2CompletesReadSuccessfully ==
                                       !.lap             = @ + 1,
                                       !.pending_add_ops = @ \union {[entry       |-> [id   |-> w2.lap + 1,
                                                                                       data |-> entry_data],
-                                                                     fragment_id |-> w2.curr_fragment.id]},
+                                                                     fragment_id |-> w2.curr_fragment.id,
+                                                                     ensemble    |-> w2.curr_fragment.ensemble]},
                                       !.recovery_phase  = ReadPhase]
               /\ ClearReadTimeouts(msg, read_ensemble)
         /\ UNCHANGED << bookie_vars, w1, meta_vars >>
@@ -842,7 +824,6 @@ Next ==
     \/ W1ReceivesAddConfirmedResponse
     \/ W1ReceivesAddFencedResponse
     \/ W1ChangesEnsemble
-    \/ W1TriesInvalidEnsembleChange
     \/ W1SendsPendingAddOp
     \/ W1CloseLedgerSuccess
     \/ W1CloseLedgerFail
@@ -856,7 +837,6 @@ Next ==
     \/ W2WritesBackEntry
     \/ W2ReceivesAddConfirmedResponse
     \/ W2ChangesEnsemble
-    \/ W2TriesInvalidEnsembleChange
     \/ W2SendsPendingAddOp
     \/ W2ClosesLedger
 
@@ -913,17 +893,6 @@ AllCommittedEntriesReachAckQuorum ==
          ELSE TRUE
 
 (***************************************************************************)
-(* Invariant: New fragments cannot have a lower first entry id than any    *)
-(*            existing fragment.                                           *)
-(*                                                                         *)
-(* This invariant is violated when a writer goes to add a fragment to the  *)
-(* metadata store that is invalid.                                         *)
-(***************************************************************************)
-OnlyValidFragments ==
-    /\ w1.status # STATUS_INVALID
-    /\ w2.status # STATUS_INVALID
-
-(***************************************************************************)
 (* Invariant: Entries must be stored in the same order the writer sent     *)
 (*            them.                                                        *)
 (*                                                                         *)
@@ -955,5 +924,4 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Dec 01 13:57:30 CET 2020 by jvanlightly
-\* Created Tue Nov 10 13:36:16 CET 2020 by jvanlightly
+\* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly

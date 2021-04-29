@@ -1,6 +1,8 @@
 # BookKeeper Replication Protocol TLA+ Specification
 
-This spec models the life of a single ledger with a writer, multiple bookies
+This repo contains a number of variants of the BookKeeper Replication Protocol modelled in TLA+.
+
+The specifications model the life of a single ledger with a writer, multiple bookies
 and a second writer that can perform a recovery + close.
 
 Notes:
@@ -13,25 +15,41 @@ Notes:
     - Auto-recovery (a higher level spec would be required to specifically model that)
 - Deviations:
     - The recovery reads and writes in the implementation are concurrent, for performance. This specification however splits them up into separate phases. The reason for this is to reduce the state space. Whether they are concurrent or in two phases does not affect correctness.
+- Terms
+    - The word "committed" is used to refer to an entry that the writer has acknowledged back to its own client.
+      This spec does not explicitly include acknowledgements by the writers, but assumes it given enough positive responses by bookies.
 
+## Opening the specifications 
 
-Terminology:
+### With the ToolBox
 
-- The word "committed" is used to refer to an entry that the writer has acknowledged back to its own client.
+The constants are sufficiently described in the specifications for anyone to create a model using the toolbox.
 
-## Opening the specification with the ToolBox
+### Via cmd line
 
-An existing model called Safety is included which has parameters already configured.
+Each spec has an associated cfg file that can be used when running from cmd line.
 
-## Defects Found or Confirmed in December 2020 BookKeeper version 4.11
+## Variants
 
-### Defect 1: Existing Fencing Not Enough to Prevent Data Loss
+### Master
+
+BookKeeperProtocol.tla will try to model the logic as it stands in the master branch. It currently contains no known protocol defects.
+
+### Proposed Changes for Running Without the Journal
+
+BookKeeperProtocolWithLimbo.tla includes proposed changes to the protocol that would allow bookies to run safely without the journal, where entries can be lost on a crash. Lost entries can cause inconsistent behaviour in the protocol leading to potentially irrecoverable data loss.
+
+### v4.13 and below
+
+BookKeeperProtocol_v4-13.tla models the protocol in its form in the release 4.13 where two defects exist.
+
+#### Defect 1: Existing Fencing Not Enough to Prevent Data Loss
 Discovered by this TLA+ specification. The defect can be found with the following commands:
 
 ```bash
 wget https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 wget https://github.com/tlaplus/CommunityModules/releases/download/202102040137/CommunityModules.jar
-java -cp tla2tools.jar:CommunityModules.jar tlc2.TLC BookKeeperProtocol.tla -tool -modelcheck -deadlock -config BookKeeperProtocol.cfg -workers auto
+java -cp tla2tools.jar:CommunityModules.jar tlc2.TLC BookKeeperProtocol_v4.13 -tool -modelcheck -deadlock -config BookKeeperProtocol_v4.13.cfg -workers auto
 ```
 
 In detail, the BookKeeper protocol defect found with this spec is that fencing of LAC reads is not enough to prevent committing an add:
