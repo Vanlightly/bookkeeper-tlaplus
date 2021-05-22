@@ -29,41 +29,46 @@ CONSTANTS WAITING,
 VARIABLES c_state
 
 \* metadata store state
-VARIABLES md_ll,
-          md_ll_version,
+VARIABLES md_llist,
+          md_llist_version,
           md_ledgers,
           md_leader,
           md_next_lid
 
-\* the ledgers that have been written to
-VARIABLES written_ledgers
-          
-vars == << c_state, md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >>        
+\* the ledgers written to bookies
+VARIABLES b_ledgers
 
-NoLedger == [id |-> 0, open |-> FALSE, version |-> -1]
+\* Auxilliary state
+VARIABLES next_entry_id \* used for monotonicly increasing entry ids, needed for invariant checking
+          
+vars == << c_state, md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>        
+
+NoLedgerMetadata == [id |-> 0, open |-> FALSE, version |-> -1]
 
 (*
     Starts with no leader and no ledgers
 *)
 Init ==
-    /\ c_state = [c \in Clients |-> [leader     |-> FALSE,
-                                     status     |-> WAITING,
-                                     ll_version |-> -1,
-                                     ledger     |-> NoLedger]]
+    /\ c_state = [c \in Clients |-> [leader        |-> FALSE,
+                                     status        |-> WAITING,
+                                     llist         |-> <<>>,
+                                     llist_version |-> -1,
+                                     ledger        |-> NoLedgerMetadata]]
     /\ md_leader = CHOOSE c \in Clients : TRUE
-    /\ md_ll_version = 0
-    /\ md_ll = <<>>
+    /\ md_llist_version = 0
+    /\ md_llist = <<>>
     /\ md_ledgers = <<>>
     /\ md_next_lid = 1
-    /\ written_ledgers = {}
+    /\ b_ledgers = {}
+    /\ next_entry_id = 0
 
 (*
-    A leader is elected by the metadata store
+    A leader is elected by the metadata store. We do not model why, how.
 *)
 LeaderChosen(c) ==
     /\ md_leader # c
     /\ md_leader' = c
-    /\ UNCHANGED << c_state, md_ll, md_ll_version, md_ledgers, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << c_state, md_llist, md_llist_version, md_ledgers, md_next_lid, b_ledgers, next_entry_id >>
 
 (*
     A client becomes aware it is the leader and assumes that role
@@ -73,7 +78,7 @@ BecomeLeader(c) ==
     /\ md_leader = c
     /\ c_state' = [c_state EXCEPT ![c].leader = TRUE,
                                   ![c].status = GET_MD_FOR_CLOSING]
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>
 
 (*
     A client that believes it is the leader becomes aware it is not the leader anymore and returns to WAITING.
@@ -84,7 +89,7 @@ Abdicate(c) ==
     /\ md_leader # c
     /\ c_state' = [c_state EXCEPT ![c].leader = FALSE,
                                   ![c].status = WAITING]
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>
 
 (* 
     A newly elected leader must first obtain the metadata of the ledger list and the 
@@ -97,14 +102,16 @@ Abdicate(c) ==
 GetLastLedger(c) ==
     /\ c_state[c].leader = TRUE
     /\ c_state[c].status = GET_MD_FOR_CLOSING
-    /\ \/ /\ md_ll # <<>>
-          /\ c_state' = [c_state EXCEPT ![c].ll_version = md_ll_version,
-                                        ![c].ledger     = md_ledgers[Last(md_ll)],
-                                        ![c].status     = CLOSE_LAST_LEDGER]
-       \/ /\ md_ll = <<>>
-          /\ c_state' = [c_state EXCEPT ![c].ll_version = md_ll_version,
-                                        ![c].status     = PENDING_CREATE_LEDGER]                                 
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >> 
+    /\ \/ /\ md_llist # <<>>
+          /\ c_state' = [c_state EXCEPT ![c].llist_version = md_llist_version,
+                                        ![c].llist         = md_llist,
+                                        ![c].ledger        = md_ledgers[Last(md_llist)],
+                                        ![c].status        = CLOSE_LAST_LEDGER]
+       \/ /\ md_llist = <<>>
+          /\ c_state' = [c_state EXCEPT ![c].llist_version = md_llist_version,
+                                        ![c].llist         = md_llist,
+                                        ![c].status        = PENDING_CREATE_LEDGER]                                 
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >> 
 
 (*
     The client leader sees that the last ledger is already closed, so moves to the PENDING_CREATE_LEDGER state.
@@ -114,11 +121,24 @@ LedgerAlreadyClosed(c) ==
     /\ c_state[c].status = CLOSE_LAST_LEDGER
     /\ c_state[c].ledger.open = FALSE
     /\ c_state' = [c_state EXCEPT ![c].status = PENDING_CREATE_LEDGER]
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>
+
 
 (*
     The client leader closes the last ledger.
+
+    When fencing the ledger, if the ledger does not exist in the bookie then
+    it gets created and fenced.
 *)
+FenceLedger(ledger_id) ==
+    IF \E ledger \in b_ledgers : ledger.id = ledger_id
+    THEN b_ledgers' = { IF l.id = ledger_id 
+                        THEN [l EXCEPT !.fenced = TRUE]
+                        ELSE l : l \in b_ledgers }
+    ELSE b_ledgers' = b_ledgers \union { [id     |-> ledger_id, 
+                                          entry  |-> -1,
+                                          fenced |-> TRUE] }
+
 CloseLastLedgerSuccess(c) ==
     /\ c_state[c].leader = TRUE
     /\ c_state[c].status = CLOSE_LAST_LEDGER
@@ -129,7 +149,8 @@ CloseLastLedgerSuccess(c) ==
             /\ md_ledgers' = [md_ledgers EXCEPT ![ledger_id].open = FALSE,
                                                 ![ledger_id].version = @ + 1]
             /\ c_state' = [c_state EXCEPT ![c].status = PENDING_CREATE_LEDGER]
-    /\ UNCHANGED << md_ll, md_ll_version, md_leader, md_next_lid, written_ledgers >>
+            /\ FenceLedger(ledger_id)
+    /\ UNCHANGED << md_llist, md_llist_version, md_leader, md_next_lid, next_entry_id >>
     
 (*
     The client leader tries to close the last ledger, but another client has updated the
@@ -142,7 +163,7 @@ CloseLastLedgerBadVersion(c) ==
     /\ c_state[c].ledger.open = TRUE
     /\ c_state[c].ledger.version < md_ledgers[c_state[c].ledger.id].version
     /\ c_state' = [c_state EXCEPT ![c].status = GET_MD_FOR_CLOSING]
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >> 
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >> 
 
 (*
     The client leader creates a new ledger.
@@ -157,7 +178,7 @@ CreateLedger(c) ==
                                         ![c].status = PENDING_APPEND_LEDGER]
           /\ md_ledgers' = md_ledgers @@ (next_ledger.id :> next_ledger)
           /\ md_next_lid' = md_next_lid + 1
-          /\ UNCHANGED << md_ll, md_ll_version, md_leader, written_ledgers >>
+          /\ UNCHANGED << md_llist, md_llist_version, md_leader, b_ledgers, next_entry_id >>
 
 (*
     The client leader appends the new ledger to the ledger list. It uses the cached
@@ -167,11 +188,16 @@ CreateLedger(c) ==
 AppendLedgerSuccess(c) ==
     /\ c_state[c].leader = TRUE
     /\ c_state[c].status = PENDING_APPEND_LEDGER 
-    /\ c_state[c].ll_version = md_ll_version
-    /\ md_ll' = Append(md_ll, c_state[c].ledger.id)
-    /\ md_ll_version' = md_ll_version + 1
-    /\ c_state' = [c_state EXCEPT ![c].status = HAS_OPEN_LEDGER]
-    /\ UNCHANGED << md_ledgers, md_leader, md_next_lid, written_ledgers >>
+    /\ c_state[c].llist_version = md_llist_version
+    /\ LET new_list    == Append(c_state[c].llist, c_state[c].ledger.id)
+           new_version == md_llist_version + 1
+       IN
+        /\ md_llist' = new_list
+        /\ md_llist_version' = new_version
+        /\ c_state' = [c_state EXCEPT ![c].status = HAS_OPEN_LEDGER,
+                                      ![c].llist = new_list,
+                                      ![c].llist_version = new_version]
+        /\ UNCHANGED << md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>
 
 (*
     The client leader tries to append the new ledger to the ledger list. It uses the cached
@@ -182,22 +208,25 @@ AppendLedgerSuccess(c) ==
 AppendLedgerBadVersion(c) ==
     /\ c_state[c].leader = TRUE
     /\ c_state[c].status = PENDING_APPEND_LEDGER 
-    /\ c_state[c].ll_version < md_ll_version
+    /\ c_state[c].llist_version < md_llist_version
     /\ c_state' = [c_state EXCEPT ![c].leader = FALSE,
                                   ![c].status = WAITING]
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>
 
 (*
-    The client leader writes to the ledger. We don't actually bother modelling individual entries. We have
-    already modelled that in the BookKeeperProtocol spec. We just want to track which ledgers
-    got written to with this spec.
+    The client leader writes to the ledger. We only model a single entry as this is enough
+    for verifying ordering/data loss and keeps the state space small. We have already modelled 
+    multiple entries in the BookKeeperProtocol spec.
 *)  
 WriteToLedger(c) ==
     /\ c_state[c].leader = TRUE
     /\ c_state[c].status = HAS_OPEN_LEDGER
-    /\ c_state[c].ledger.id \notin written_ledgers
-    /\ written_ledgers' = written_ledgers \union {c_state[c].ledger.id}
-    /\ UNCHANGED << c_state, md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid >>
+    /\ ~\E ledger \in b_ledgers : ledger.id = c_state[c].ledger.id
+    /\ b_ledgers' = b_ledgers \union { [id     |-> c_state[c].ledger.id, 
+                                        entry  |-> next_entry_id,
+                                        fenced |-> FALSE] }
+    /\ next_entry_id' = next_entry_id + 1
+    /\ UNCHANGED << c_state, md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid >>
     
 (*
     A client leader closes its own ledger and transitions to the PENDING_CREATE_LEDGER
@@ -208,12 +237,12 @@ CloseOwnLedgerSuccess(c) ==
     /\ c_state[c].status = HAS_OPEN_LEDGER
     /\ LET ledger == c_state[c].ledger
        IN
-            /\ ledger.id \in written_ledgers
+            /\ \E l \in b_ledgers : l.id = ledger.id
             /\ ledger.version = md_ledgers[ledger.id].version
             /\ md_ledgers' = [md_ledgers EXCEPT ![ledger.id].open = FALSE,
                                                 ![ledger.id].version = @ + 1]
             /\ c_state' = [c_state EXCEPT ![c].status = PENDING_CREATE_LEDGER]
-    /\ UNCHANGED << md_ll, md_ll_version, md_leader, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << md_llist, md_llist_version, md_leader, md_next_lid, b_ledgers, next_entry_id >>
 
 (*
     A client leader tries to close its own ledger but can't as ledger metadata was
@@ -224,11 +253,11 @@ CloseOwnLedgerBadVersion(c) ==
     /\ c_state[c].status = HAS_OPEN_LEDGER
     /\ LET ledger == c_state[c].ledger
        IN
-            /\ ledger.id \in written_ledgers
+            /\ \E l \in b_ledgers : l.id = ledger.id
             /\ ledger.version < md_ledgers[ledger.id].version
             /\ c_state' = [c_state EXCEPT ![c].leader = FALSE,
                                           ![c].status = WAITING]
-    /\ UNCHANGED << md_ll, md_ll_version, md_ledgers, md_leader, md_next_lid, written_ledgers >>
+    /\ UNCHANGED << md_llist, md_llist_version, md_ledgers, md_leader, md_next_lid, b_ledgers, next_entry_id >>
                                           
                                           
 Next ==
@@ -259,36 +288,49 @@ ClientStatuses == {
           PENDING_APPEND_LEDGER,
           HAS_OPEN_LEDGER }
 
-Ledger == [id: Nat, open: BOOLEAN, version: Nat \union {-1}]
+LedgerMetadata == [id: Nat, open: BOOLEAN, version: Nat \union {-1}]
+Ledger == [id: Nat, entry: Nat \union {-1}, fenced: BOOLEAN]
 
 Client == [leader: BOOLEAN,
            status: ClientStatuses,
-           ll_version: Nat \union {-1},
-           ledger: Ledger]
+           llist_version: Nat \union {-1},
+           llist: Seq(Nat),
+           ledger: LedgerMetadata]
           
 TypeOK ==
     /\ c_state \in [Clients -> Client]
     /\ md_leader \in Clients
-    /\ md_ll_version \in Nat
+    /\ md_llist_version \in Nat
     /\ \/ md_next_lid = 1
        \/ /\ md_next_lid > 1
-          /\ md_ledgers \in [1..(md_next_lid - 1) -> Ledger]
-          /\ written_ledgers \in SUBSET (1..(md_next_lid - 1))
+          /\ md_ledgers \in [1..(md_next_lid - 1) -> LedgerMetadata]
+          /\ b_ledgers \in SUBSET Ledger
     /\ md_next_lid \in Nat
 
 (*
     Invariant: No ledgers that were written to ended up outside
                of the ledger list.
 *)
-NoWrittenToLedgersLost ==
-    IF written_ledgers # {}
+AllNonEmptyLedgersInLedgerList ==
+    IF b_ledgers # {}
     THEN     
-        ~\E l \in 1..(md_next_lid - 1) :
-           /\ l \in written_ledgers
-           /\ \/ md_ll = <<>>
-              \/ ~\E mdl \in DOMAIN md_ll : l = md_ll[mdl]
+        ~\E ledger_id \in 1..(md_next_lid - 1) :
+           /\ \E ledger \in b_ledgers : ledger.id = ledger_id
+           /\ \/ md_llist = <<>>
+              \/ ~\E mdl \in DOMAIN md_llist : ledger_id = md_llist[mdl]
     ELSE TRUE
-    
+
+(*
+    Invariant: The entries written across the ledgers 
+*)
+EntryOrderMaintained ==
+    \A l1 \in b_ledgers :
+        /\ ~\E l2 \in b_ledgers :
+            /\ l1.id < l2.id
+            /\ l1.entry > l2.entry
+            \* neither is an empty fenced ledger
+            /\ l1.entry # -1 
+            /\ l2.entry # -1
 (* 
     Constraints
 *)    
