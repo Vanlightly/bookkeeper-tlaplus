@@ -321,7 +321,8 @@ AllNonEmptyLedgersInLedgerList ==
     ELSE TRUE
 
 (*
-    Invariant: The entries written across the ledgers 
+    Invariant: The entries written across the ledgers maintain
+               temporal ordering
 *)
 EntryOrderMaintained ==
     \A l1 \in b_ledgers :
@@ -331,6 +332,19 @@ EntryOrderMaintained ==
             \* neither is an empty fenced ledger
             /\ l1.entry # -1 
             /\ l2.entry # -1
+
+(*
+    Invariant: There cannot be more than one open ledger in the
+               ledger list at anytime.
+*)
+OnlyOneLedgerOpenAtATime ==
+    IF md_llist # <<>>
+    THEN ~\E l1, l2 \in DOMAIN md_llist :
+            /\ l1 # l2
+            /\ md_ledgers[l1].open = TRUE
+            /\ md_ledgers[l2].open = TRUE
+    ELSE TRUE
+
 (* 
     Constraints
 *)    
