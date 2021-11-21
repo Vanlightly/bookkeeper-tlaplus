@@ -2,3 +2,4 @@
 states/
 *.jar
 detailed.log
+*.toolbox/
