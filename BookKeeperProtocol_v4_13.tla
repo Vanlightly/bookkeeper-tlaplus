@@ -1,5 +1,5 @@
-------------------------- MODULE BookKeeperProtocol_v4-13 -------------------------
-EXTENDS MessagePassing, Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
+------------------------- MODULE BookKeeperProtocol_v4_13 -------------------------
+EXTENDS MessagePassing_v4_13, Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
 (*
 This specification is refers to released version 4.13.
@@ -972,5 +972,6 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
+\* Last modified Mon Nov 22 10:23:03 CET 2021 by GUNMETAL
 \* Last modified Tue Dec 01 13:57:30 CET 2020 by jvanlightly
 \* Created Tue Nov 10 13:36:16 CET 2020 by jvanlightly
