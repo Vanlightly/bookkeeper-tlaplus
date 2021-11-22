@@ -10,31 +10,36 @@ See the readme for more information.
 CONSTANTS Bookies,                      \* The bookies available e.g. { B1, B2, B3, B4 }
           Clients,                      \* The clients e.g. {c1, c2}
           WriteQuorum,                  \* The replication factor under normal circumstances
-          AckQuorum,                    \* The number of bookies required to acknowledge an entry for the
-                                        \* writer to acknowledge to its own client, also the minimum
+          AckQuorum,                    \* The number of bookies that must confirm an entry for the
+                                        \* client to acknowledge to its own client, also the minimum
                                         \* replication factor (can occur in scenarios such as ensemble change or ledger closes)
           SendLimit                     \* The data items to send. Limited to a very small number of data items
-                                        \* in order to keep the state space small. E.g 2
+                                        \* in order to keep the state space small. E.g 1 or 2
 
 \* Model values
 CONSTANTS Nil,
+          NoSuchEntry,
+          Unknown,
+          OK,
+          NeedMoreResponses,
           STATUS_OPEN,
           STATUS_IN_RECOVERY,
           STATUS_CLOSED,
-          CLIENT_WITHDRAWN
+          CLIENT_WITHDRAWN,
+          RECOVERY_ABORTED
 
 \* Ledger state in the metadata store
 VARIABLES meta_status,              \* the ledger status
           meta_fragments,           \* ledger fragments
-          meta_last_entry,          \* the endpoint of the ledger
-          meta_version              \* ledger metatdata version
+          meta_last_entry,          \* the endpoint of the ledger (set on closing)
+          meta_version              \* ledger metadata version
 
 \* Bookie state (each is a function whose domain is the set of bookies) pertaining to this single ledger
 VARIABLES b_entries,                \* the entries stored in each bookie
           b_fenced,                 \* the fenced status of each bookie (TRUE/FALSE)
           b_lac                     \* the last add confirmed of each bookie
 
-\* the state of the two writers
+\* the state of the clients
 VARIABLES clients                   \* the set of BookKeeper clients
 
 ASSUME SendLimit \in Nat
@@ -45,22 +50,21 @@ ASSUME AckQuorum \in Nat
 ASSUME AckQuorum > 0
 ASSUME WriteQuorum >= AckQuorum
 
-
 bookie_vars == << b_fenced, b_entries, b_lac >>
 meta_vars == << meta_status, meta_fragments, meta_last_entry, meta_version >>
 vars == << bookie_vars, clients, meta_vars, messages >>
 
 (***************************************************************************)
 (* Recovery Phases                                                         *)
-(* In order to reduce the state space, w2 goes through recovery in phases. *)
+(* In order to reduce the state space, recovery reads and writes are split *)
+(* into a read phase and a write phase.                                    *)
 (* The implementation works with reads and writes concurrently but this    *)
 (* does not affect correctness.                                            *)
 (***************************************************************************)
 NotStarted == 0
 FencingPhase == 1
 ReadPhase == 2
-PendingReadResponsePhase == 3
-WritePhase == 4
+WritePhase == 3
 
 (***************************************************************************)
 (* Records                                                                 *)
@@ -82,6 +86,9 @@ PendingAddOp ==
 
 ClientStatuses ==
     {Nil, STATUS_OPEN, STATUS_IN_RECOVERY, STATUS_CLOSED, CLIENT_WITHDRAWN}
+    
+ReadResponses ==
+    { OK, NoSuchEntry, Unknown } 
 
 ClientState ==
     [id: Clients,
@@ -95,8 +102,7 @@ ClientState ==
      confirmed: [EntryIds -> SUBSET Bookies],   \* The bookies that have confirmed each entry id
      fenced: SUBSET Bookies,                    \* The bookies that have confirmed they are fenced to this client
      curr_read_entry: Entry \union {Nil},       \* The entry currently being read (during recovery)
-     has_entry: SUBSET Bookies,                 \* Which bookies confirmed they have the current entry being read
-     no_such_entry: SUBSET Bookies,             \* Which bookies confirmed they do not have the current entry being read
+     read_responses: SUBSET ReadResponses,      \* The recovery read responses of the current entry
      recovery_phase: 0..WritePhase]             \* The recovery phase (an artifical phase for reducing state space)
 
 \* Each client starts empty, no state
@@ -112,8 +118,7 @@ InitClient(cid) ==
      confirmed       |-> [id \in EntryIds |-> {}],
      fenced          |-> {},
      curr_read_entry |-> Nil,
-     has_entry       |-> {},
-     no_such_entry   |-> {},
+     read_responses  |-> {},
      recovery_phase  |-> 0]
 
 (***************************************************************************)
@@ -149,6 +154,39 @@ EnsembleAvailable(include_bookies, exclude_bookies) ==
 SelectEnsemble(include_bookies, exclude_bookies) ==
     CHOOSE ensemble \in SUBSET Bookies :
         ValidEnsemble(ensemble, include_bookies, exclude_bookies)
+        
+(***************************************************************************)
+(* QuorumCoverage                                                          *)
+(*                                                                         *)
+(* Quorum coverage is a quorum that is required in two places in the       *)
+(* protocol:                                                               *)
+(* - LAC fencing requests must have been confirmed such that there exists  *)
+(*   no ack quorum of bookies in the current ledger ensemble that remain   *)
+(*   unfenced.                                                             *)
+(* - An entry is only unrecoverable when there is no ack quorum of bookies *)
+(*   of the entry ensemble that have or could confirm they have the entry. *)
+(*                                                                         *)
+(* This can be expressed in different ways:                                *)
+(* - There exists no ack quorum of bookies within the cohort that don't    *)
+(*   satisfy the property.                                                 *)
+(* - In every ack quorum of bookies of the cohort, at least one bookie     *)
+(*   must satisfy the property.                                            *)           
+(*                                                                         *)
+(* It can also simply be distilled down to (Write Quorum - AckQuorum) + 1  *)
+(* bookies must satisfy the property.                                      *)
+(* Note that this spec does not model Ensemble size /= Write Quorum so the *)
+(* cohort size is always Write Quorum.                                     *)
+(*                                                                         *)
+(***************************************************************************)
+
+HasQuorumCoverage(s) ==
+    Cardinality(s) >= ((WriteQuorum - AckQuorum) + 1)
+    
+(* A more complex way of checking quorum coverage   
+QuorumCoverageAlt(quorum_that_satisifies_prop, ensemble) ==
+    \A ack_quorum \in { s \in SUBSET ensemble : Cardinality(s) = AckQuorum } :
+        quorum_that_satisifies_prop \intersect ack_quorum # {}
+*)       
 
 (***************************************************************************)
 (* ACTION: Create ledger                                                   *)
@@ -173,10 +211,11 @@ ClientCreatesLedger(cid) ==
     /\ UNCHANGED << bookie_vars, meta_last_entry, messages >>
 
 (***************************************************************************)
-(* ACTION: Send Add Entry Requests for a given data item                   *)
+(* ACTION: Send Add Entry Requests                                         *)
 (*                                                                         *)
 (* The client sends an AddEntryRequestMessage to each bookie of the        *)
-(* current fragment ensemble for a data item not yet sent.                 *)
+(* current fragment ensemble. The data sent is simply an integer that      *)
+(* increases by one on each send, forming a sequence (1,2,3 etc).          *)
 (***************************************************************************)
 
 GetAddEntryRequests(c, entry, ensemble, recovery) ==
@@ -208,7 +247,7 @@ ClientSendsAddEntryRequests(cid) ==
     /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************)
-(* ACTION: A bookie receive an AddEntryRequestMessage, Sends a confirm.    *)
+(* ACTION: A bookie receives an AddEntryRequestMessage, Sends a confirm.   *)
 (*                                                                         *)
 (* A bookie receives a AddEntryRequestMessage, the ledger is not fenced so *)
 (* it adds the entry and responds with a success response.                 *)
@@ -378,7 +417,7 @@ ChangeEnsemble(c, recovery) ==
     /\ \/ recovery
        \/ ~recovery /\ c.meta_version = meta_version
     /\ \E bookie \in c.curr_fragment.ensemble :
-        /\ WriteTimeoutForBookie(messages, bookie, recovery)
+        /\ WriteTimeoutForBookie(messages, c.id, bookie, recovery)
         /\ EnsembleAvailable(c.curr_fragment.ensemble \ {bookie}, {bookie})
         /\ ValidNextFragment(c.lac + 1)
         /\ LET new_ensemble   == SelectEnsemble(c.curr_fragment.ensemble \ {bookie}, {bookie})
@@ -398,7 +437,7 @@ ChangeEnsemble(c, recovery) ==
                                                                    ELSE c.confirmed[id]],
                                               !.fragments     = updated_fragments,
                                               !.curr_fragment = Last(updated_fragments)]]
-                /\ ClearWriteTimeout(bookie, recovery)
+                /\ ClearWriteTimeout(c.id, bookie, recovery)
 
 ClientChangesEnsemble(cid) ==
     /\ clients[cid].status = STATUS_OPEN
@@ -418,7 +457,7 @@ RecoveryClientChangesEnsemble(cid) ==
 (* A pending add op needs to be sent to one or more bookies of a           *)
 (* new ensemble due to a previous bookie write failure.                    *)
 (* We resend a pending add op when it has a different fragment id          *) 
-(* or different ensemble the current fragment (basically the op was not    *)
+(* or different ensemble to the current fragment (basically the op was not *)
 (* updated yet with the ensemble change.                                   *)  
 (* The ensemble change may have been a replacement rather than appended    *)
 (* so the id may be the same but the ensemble different, hence checking    *)
@@ -503,7 +542,7 @@ ClientClosesLedgerFail(cid) ==
 (***************************************************************************)
 (* ACTION: A client start ledger recovery.                                 *)
 (*                                                                         *)
-(* A second client decides to start the recovery process for the ledger.   *)
+(* A recovery client decides to start the recovery process for the ledger. *)
 (* Changes the meta status to IN_RECOVERY and sends a fencing read LAC     *)
 (* request to each bookie in the current ensemble.                         *)
 (*                                                                         *)
@@ -532,8 +571,7 @@ ClientStartsRecovery(cid) ==
 (* ACTION: A bookie receives a fencing LAC request, send a response.       *)
 (*                                                                         *)
 (* A bookie receives a fencing read LAC request and sends back a success   *)
-(* response with its LAC. We only model a single second writer, so this    *)
-(* will only happen once per bookie (of current ensemble).                 *)
+(* response with its LAC.                                                  *)
 (***************************************************************************)
 
 GetFencingReadLacResponseMessage(msg) ==
@@ -552,7 +590,7 @@ BookieSendsFencingReadLacResponse ==
 (***************************************************************************)
 (* ACTION: Receive a fence response                                        *)
 (*                                                                         *)
-(* The second client receives a success FenceResponseMessage               *)
+(* A recovery client receives a success FenceResponseMessage               *)
 (* and takes note of the bookie that confirmed its fenced status and if    *)
 (* its LAC is highest, stores it.                                          *)
 (* Once the read phase has started any late arriving LAC reads are ignored.*)
@@ -584,19 +622,14 @@ ClientReceivesFencingReadLacResponse(cid) ==
                 /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************)
-(* ACTION: Recovery client send a recovery read request to each bookie.    *)
+(* ACTION: Recovery client sends a recovery read request to each bookie.   *)
 (*                                                                         *)
-(* The second client sends a ReadRequestMessage to each bookie of the      *)
+(* The recovery client sends a ReadRequestMessage to each bookie of the    *)
 (* current ensemble once every ack quorum has at least one fenced bookie.  *)
+(* Recovery reads set the fencing flag.                                    *)
 (*                                                                         *)
 (* NOTE1: Remember that entry ids start at 1 in this spec as TLA+ is base 1*)
 (***************************************************************************)
-
-NotSentRead(c, entry_id) ==
-    ~\E msg \in DOMAIN messages :
-        /\ msg.type = ReadRequestMessage
-        /\ msg.entry_id = entry_id
-        /\ msg.cid = c.id
 
 GetRecoveryReadRequests(c, entry_id, ensemble) ==
     { [type     |-> ReadRequestMessage,
@@ -605,18 +638,18 @@ GetRecoveryReadRequests(c, entry_id, ensemble) ==
        entry_id |-> entry_id,
        fence    |-> TRUE] : b \in ensemble }
 
-ClientSendsReadRequests(cid) ==
+ClientSendsRecoveryReadRequests(cid) ==
     LET c == clients[cid]
     IN
         /\ c.status = STATUS_IN_RECOVERY
         /\ \/ c.recovery_phase = ReadPhase
            \/ /\ c.recovery_phase = FencingPhase
-              /\ \A ack_quorum \in { s \in SUBSET c.curr_fragment.ensemble : Cardinality(s) = AckQuorum } :
-                    c.fenced \intersect ack_quorum # {}
+              /\ HasQuorumCoverage(c.fenced) 
+        /\ c.curr_read_entry = Nil
         /\ LET next_entry_id == c.lap+1
            IN
-            /\ NotSentRead(c, next_entry_id)
-            /\ clients' = [clients EXCEPT ![c.id] = [c EXCEPT !.recovery_phase = PendingReadResponsePhase]]
+            /\ clients' = [clients EXCEPT ![c.id] = [c EXCEPT !.recovery_phase = ReadPhase,
+                                                              !.curr_read_entry = next_entry_id]]
             /\ SendMessagesToEnsemble(GetRecoveryReadRequests(c, next_entry_id, 
                                                               FragmentOfEntryId(next_entry_id, c.fragments).ensemble))
             /\ UNCHANGED << bookie_vars, meta_vars >>
@@ -634,130 +667,110 @@ GetReadResponseMessage(msg) ==
      cid      |-> msg.cid,
      entry    |-> IF \E entry \in b_entries[msg.bookie] : entry.id = msg.entry_id
                   THEN CHOOSE entry \in b_entries[msg.bookie] : entry.id = msg.entry_id
-                  ELSE Nil,
-     fence    |-> msg.fence]
+                  ELSE [id |-> msg.entry_id, data |-> Nil],
+     fence    |-> msg.fence,
+     code     |-> IF \E entry \in b_entries[msg.bookie] : entry.id = msg.entry_id
+                  THEN OK
+                  ELSE NoSuchEntry]
 
 BookieSendsReadResponse ==
     \E msg \in DOMAIN messages :
         /\ ReceivableMessageOfType(messages, msg, ReadRequestMessage)
-        /\ b_fenced' = [b_fenced EXCEPT ![msg.bookie] = TRUE]
+        /\ IF msg.fence = TRUE \* only recovery reads modelled which are always fenced
+           THEN b_fenced' = [b_fenced EXCEPT ![msg.bookie] = TRUE]
+           ELSE UNCHANGED << b_fenced >>
         /\ ProcessedOneAndSendAnother(msg, GetReadResponseMessage(msg))
         /\ UNCHANGED << b_entries, b_lac, clients, meta_vars >>
 
 (***************************************************************************)
-(* ACTION: Client receives a non final read response.                      *)
+(* ACTION: Client receives a read response.                                *)
 (*                                                                         *)
-(* A recovery client receives either a success ReadResponseMessage         *)
-(* or a NoSuchEntry (entry=Nil). This action occurs when there are still   *)
-(* more responses pending (including timeouts).                            *)
+(* On receiving each response, the recovery client must decide whether     *)
+(* the entry is recoverable, non-recoverable or needs more responses to    *)
+(* decide. In order to balance performance with safety, the client is      *)
+(* generous with positive results (only requires one positive read to      *)
+(* treat an entry as recoverable) but strict on negative results (requires *)
+(* quorum coverage of NoSuchEntry responses to treat an entry as           *)
+(* unrecoverable).                                                         *)
+(*                                                                         *)
+(* If the entry is recoverable then the entry is adding to the list of     *)
+(* pending add ops that must be sent in the Write Phase. The next action   *)
+(* will be to send recovery reads of the next entry.                       *)
+(*                                                                         *)
+(* If the entry is unrecoverable, then the read phase is finished.         *)
+(*                                                                         *)
+(* If all responses have been received and still neither the positive      *)
+(* threshold of 1 or the negative threshold of quorum coverage (WQ-AQ)+1   *)
+(* has been reached, the final result of the read is Unknown, and the      *)
+(* recovery is aborted.                                 *)
 (***************************************************************************)
 
-ReceivedAllResponses(has_entry, no_such_entry, ensemble) ==
-    Cardinality(has_entry) + Cardinality(no_such_entry) + ReadTimeoutCount(ensemble, TRUE) = WriteQuorum
+ReadStatus(c, responses) ==
+    IF \E msg \in responses : msg.code = OK 
+    THEN OK \* generous on positive results
+    ELSE \* strict on negative
+         IF HasQuorumCoverage({msg \in responses : msg.code = NoSuchEntry })
+         THEN NoSuchEntry
+         ELSE \* all responses in and neither positive nor negative threshold reached
+              IF Cardinality(responses) 
+                + ReadTimeoutCount(c.id, c.curr_fragment.ensemble, TRUE) = WriteQuorum
+              THEN Unknown
+              ELSE NeedMoreResponses
 
-NotEnoughBookies(no_such_entry) ==
-    Cardinality(no_such_entry) >= (WriteQuorum - AckQuorum) + 1
-
-EnoughBookies(has_entry) ==
-    Cardinality(has_entry) >= AckQuorum
-
-ReadSuccess(read_ensemble, has_entry, no_such_entry) ==
-   IF /\ ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
-      /\ EnoughBookies(has_entry)
-   THEN TRUE
-   ELSE FALSE
-
-ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry) ==
-    IF /\ ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
-       /\ NotEnoughBookies(no_such_entry)
-    THEN TRUE
-    ELSE FALSE
-
-ClientReceivesNonFinalRead(cid) ==
+ReadPositive(c, msg, responses, read_ensemble) ==
+    /\ clients' = [clients EXCEPT ![c.id] = 
+                        [c EXCEPT !.curr_read_entry = Nil, \* reset for next read
+                                  !.read_responses  = {},  \* reset for next read
+                                  !.fenced          = IF msg.fence = TRUE THEN @ \union {msg.bookie} ELSE @,
+                                  !.lap             = @ + 1,
+                                  !.pending_add_ops = @ \union {[entry       |-> [id   |-> c.lap + 1,
+                                                                                  data |-> msg.entry.data],
+                                                                 fragment_id |-> c.curr_fragment.id,
+                                                                 ensemble    |-> c.curr_fragment.ensemble]}]]
+    /\ IgnoreFurtherReadResponses(msg, read_ensemble)
+      
+ReadNegative(c, msg, responses, read_ensemble) ==
+    /\ clients' = [clients EXCEPT ![c.id] = 
+                    [c EXCEPT !.curr_read_entry = Nil, \* reset to reduce state space
+                              !.read_responses  = {}, \* reset to reduce state space
+                              !.fenced          = IF msg.fence = TRUE
+                                                  THEN @ \union {msg.bookie}
+                                                  ELSE @,
+                              !.recovery_phase  = WritePhase]]
+    /\ IgnoreFurtherReadResponses(msg, read_ensemble)
+    
+ReadUnknown(c, msg, responses, read_ensemble) ==
+    /\ clients' = [clients EXCEPT ![c.id] = 
+                    [c EXCEPT !.status = RECOVERY_ABORTED,
+                              !.curr_read_entry = Nil, \* reset to reduce state space
+                              !.read_responses  = {}, \* reset to reduce state space
+                              !.fenced          = IF msg.fence = TRUE
+                                                  THEN @ \union {msg.bookie}
+                                                  ELSE @]]
+    /\ IgnoreFurtherReadResponses(msg, read_ensemble)
+    
+NotEnoughReadResponses(c, msg, responses) ==
+    clients' = [clients EXCEPT ![c.id] = 
+                    [c EXCEPT !.read_responses = responses, 
+                              !.fenced         = IF msg.fence = TRUE
+                                                 THEN @ \union {msg.bookie}
+                                                 ELSE @]]    
+    
+ClientReceivesRecoveryReadResponse(cid) ==
     LET c == clients[cid]
     IN
         \E msg \in DOMAIN messages :
             /\ msg.cid = cid
             /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-            /\ LET read_ensemble == IF msg.entry # Nil THEN FragmentOfEntryId(msg.entry.id, c.fragments).ensemble ELSE {}
-                   has_entry     == IF msg.entry # Nil THEN c.has_entry \union {msg.bookie} ELSE c.has_entry
-                   no_such_entry == IF msg.entry = Nil THEN c.no_such_entry \union {msg.bookie} ELSE c.no_such_entry
-               IN /\ ~ReceivedAllResponses(has_entry, no_such_entry, read_ensemble)
-                  /\ clients' = [clients EXCEPT ![c.id] = 
-                                        [c EXCEPT !.has_entry       = has_entry,
-                                                  !.no_such_entry   = no_such_entry,
-                                                  !.curr_read_entry = IF msg.entry # Nil THEN msg.entry ELSE @,
-                                                  !.fenced          = IF msg.fence = TRUE THEN @ \union {msg.bookie} ELSE @]]
-                  /\ MessageProcessed(msg)
-            /\ UNCHANGED << bookie_vars, meta_vars >>
-
-(***************************************************************************)
-(* ACTION: A client recovery read completes successfullly.                 *)
-(*                                                                         *)
-(* A recovery client receives a recovery read response such that:          *)
-(* 1. all responses have either been received or have timed out            *)
-(* 2. there are enough bookies to count as a successful read               *)
-(* More read requests will subsequently be sent out.                       *)
-(***************************************************************************)
-ClientCompletesReadSuccessfully(cid) ==
-    LET c == clients[cid]
-    IN
-        \E msg \in DOMAIN messages :
-            /\ msg.cid = cid
-            /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-            /\ LET read_ensemble == IF msg.entry # Nil THEN FragmentOfEntryId(msg.entry.id, c.fragments).ensemble ELSE {}
-                   has_entry     == IF msg.entry # Nil THEN c.has_entry \union {msg.bookie} ELSE c.has_entry
-                   no_such_entry == IF msg.entry = Nil THEN c.no_such_entry \union {msg.bookie} ELSE c.no_such_entry
-               IN /\ ReadSuccess(read_ensemble, has_entry, no_such_entry)
-                  /\ LET entry_data == IF msg.entry = Nil THEN c.curr_read_entry.data ELSE msg.entry.data
-                     IN
-                      /\ clients' = [clients EXCEPT ![c.id] = 
-                                [c EXCEPT !.has_entry       = {}, \* reset for next read
-                                          !.no_such_entry   = {}, \* reset for next read
-                                          !.curr_read_entry = Nil, \* reset for next read
-                                          !.fenced          = IF msg.fence = TRUE THEN @ \union {msg.bookie} ELSE @,
-                                          !.lap             = @ + 1,
-                                          !.pending_add_ops = @ \union {[entry       |-> [id   |-> c.lap + 1,
-                                                                                          data |-> entry_data],
-                                                                         fragment_id |-> c.curr_fragment.id,
-                                                                         ensemble    |-> c.curr_fragment.ensemble]},
-                                          !.recovery_phase  = ReadPhase]]
-                  /\ ClearReadTimeouts(msg, read_ensemble)
-            /\ UNCHANGED << bookie_vars, meta_vars >>
-
-(***************************************************************************)
-(* ACTION: A recovery read completes with NoSuchEntry/Ledger.              *)
-(*                                                                         *)
-(* A recovery client receives a read such that:                            *)
-(* 1. all responses have either been received or have timed out            *)
-(* 2. there are not enough bookies to count as a successful read           *)
-(*    NOTE: this is an explicit count of those that confirmed they do not  *)
-(*          have the entry. Time outs do not count.                        *)
-(* This concludes the read phase. Note that the protocol runs the reads    *)
-(* and write concurrently. This spec separates them to reduce the state    *)
-(* space.                                                                  *)
-(***************************************************************************)
-
-ClientCompletesReadWithNoSuchEntry(cid) ==
-    LET c == clients[cid]
-    IN
-        \E msg \in DOMAIN messages :
-            /\ msg.cid = cid
-            /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-            /\ LET read_ensemble == IF msg.entry # Nil THEN FragmentOfEntryId(msg.entry.id, c.fragments).ensemble ELSE {}
-                   has_entry     == IF msg.entry # Nil THEN c.has_entry \union {msg.bookie} ELSE c.has_entry
-                   no_such_entry == IF msg.entry = Nil THEN c.no_such_entry \union {msg.bookie} ELSE c.no_such_entry
+            /\ msg.entry.id = c.curr_read_entry \* ignore any responses not of the current read
+            /\ LET read_responses == c.read_responses \union {msg}
+                   read_status == ReadStatus(c, read_responses)
                IN
-                  /\ ReadIsNoSuchEntry(read_ensemble, has_entry, no_such_entry)
-                  /\ clients' = [clients EXCEPT ![c.id] = 
-                                    [c EXCEPT !.has_entry       = {}, \* reset to reduce state space
-                                              !.no_such_entry   = {}, \* reset to reduce state space
-                                              !.curr_read_entry = Nil, \* reset to reduce state space
-                                              !.fenced          = IF msg.fence = TRUE
-                                                                  THEN @ \union {msg.bookie}
-                                                                  ELSE @,
-                                              !.recovery_phase  = WritePhase]]
-                  /\ ClearReadTimeouts(msg, read_ensemble)
+                  /\ CASE read_status = OK -> ReadPositive(c, msg, read_responses, c.curr_fragment.ensemble)
+                      [] read_status = NoSuchEntry -> ReadNegative(c, msg, read_responses, c.curr_fragment.ensemble)
+                      [] read_status = Unknown -> ReadUnknown(c, msg, read_responses, c.curr_fragment.ensemble)
+                      [] read_status = NeedMoreResponses -> NotEnoughReadResponses(c, msg, read_responses)
+                  /\ MessageProcessed(msg)
             /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************)
@@ -854,10 +867,8 @@ Next ==
         \* recovery clients
         \/ ClientStartsRecovery(cid)
         \/ ClientReceivesFencingReadLacResponse(cid)
-        \/ ClientSendsReadRequests(cid)
-        \/ ClientReceivesNonFinalRead(cid)
-        \/ ClientCompletesReadSuccessfully(cid)
-        \/ ClientCompletesReadWithNoSuchEntry(cid)
+        \/ ClientSendsRecoveryReadRequests(cid)
+        \/ ClientReceivesRecoveryReadResponse(cid)
         \/ ClientWritesBackEntry(cid)
         \/ RecoveryClientReceivesAddConfirmedResponse(cid)
         \/ RecoveryClientChangesEnsemble(cid)
@@ -946,8 +957,7 @@ Liveness ==
 
 Spec == Init /\ [][Next]_vars
 
-
 =============================================================================
 \* Modification History
-\* Last modified Sat Nov 20 19:08:24 CET 2021 by GUNMETAL
+\* Last modified Mon Nov 22 11:52:02 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly

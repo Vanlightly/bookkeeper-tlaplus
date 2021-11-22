@@ -31,39 +31,46 @@ VARIABLES messages
 (*       but the bookie process the read request first, and the add second.*)
 (***************************************************************************)
 
-ReadTimeoutForBookie(msgs, bookie) ==
+ReadTimeoutForBookie(msgs, cid, bookie) ==
     \E msg \in DOMAIN msgs :
         /\ msgs[msg] = -1
         /\ msg.bookie = bookie
+        /\ msg.cid = cid
         /\ msg.type \in {ReadRequestMessage, ReadResponseMessage}
 
-WriteTimeoutForBookie(msgs, bookie, recovery) ==
+WriteTimeoutForBookie(msgs, cid, bookie, recovery) ==
     \E msg \in DOMAIN msgs :
         /\ msgs[msg] = -1
         /\ msg.bookie = bookie
+        /\ msg.cid = cid
         /\ msg.type \in {AddEntryRequestMessage, AddEntryResponseMessage}
         /\ msg.recovery = recovery
 
 
-ReadTimeoutCount(ensemble, recovery) ==
-    IF \E b \in ensemble : ReadTimeoutForBookie(messages, b)
-    THEN Cardinality({ b \in ensemble : ReadTimeoutForBookie(messages, b)})
+ReadTimeoutCount(cid, ensemble, recovery) ==
+    IF \E b \in ensemble : ReadTimeoutForBookie(messages, cid, b)
+    THEN Cardinality({ b \in ensemble : ReadTimeoutForBookie(messages, cid, b)})
     ELSE 0
 
-ClearWriteTimeout(bookie, recovery) ==
+ClearWriteTimeout(cid, bookie, recovery) ==
     messages' = [m \in DOMAIN messages |-> IF /\ (m.type = AddEntryRequestMessage \/ m.type = AddEntryResponseMessage)
                                               /\ m.bookie = bookie
+                                              /\ m.cid = cid
                                               /\ m.recovery = recovery
                                               /\ messages[m] = -1
                                            THEN 0
                                            ELSE messages[m]]
 
-ClearReadTimeouts(msg, ensemble) ==
+\* Ignore the undelivered messages that match.
+\* This is a state space optimization that makes these messages
+\* never get delivered
+IgnoreFurtherReadResponses(msg, ensemble) ==
     messages' = [m \in DOMAIN messages |-> IF msg = m
                                            THEN 0
                                            ELSE IF /\ m.bookie \in ensemble
+                                                   /\ m.cid = msg.cid
                                                    /\ (m.type = ReadRequestMessage \/ m.type = ReadResponseMessage)
-                                                   /\ messages[m] = -1
+                                                   /\ messages[m] = 1
                                                 THEN 0
                                                 ELSE messages[m]]
 
@@ -120,5 +127,6 @@ IsEarliestMsg(msg) ==
 
 =============================================================================
 \* Modification History
+\* Last modified Sun Nov 21 20:05:54 CET 2021 by GUNMETAL
 \* Last modified Mon Nov 23 09:37:09 CET 2020 by jvanlightly
 \* Created Mon Nov 23 09:19:26 CET 2020 by jvanlightly
