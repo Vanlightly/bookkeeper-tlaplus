@@ -63,8 +63,7 @@ vars == << bookie_vars, clients, meta_vars, messages >>
 (***************************************************************************)
 NotStarted == 0
 FencingPhase == 1
-ReadPhase == 2
-WritePhase == 3
+ReadWritePhase == 2
 
 (***************************************************************************)
 (* Records                                                                 *)
@@ -101,25 +100,32 @@ ClientState ==
      lac: Nat,                                  \* The Last Add Confirmed of a client
      confirmed: [EntryIds -> SUBSET Bookies],   \* The bookies that have confirmed each entry id
      fenced: SUBSET Bookies,                    \* The bookies that have confirmed they are fenced to this client
+     \* ledger recovery only
+     recovery_ensemble: SUBSET Bookies,         \* The ensemble of the last fragment at the beginning of recovery
+                                                \* where all read recovery requests are sent
      curr_read_entry: Entry \union {Nil},       \* The entry currently being read (during recovery)
      read_responses: SUBSET ReadResponses,      \* The recovery read responses of the current entry
-     recovery_phase: 0..WritePhase]             \* The recovery phase (an artifical phase for reducing state space)
+     recovery_phase: 0..ReadWritePhase,         \* The recovery phases
+     last_recoverable_entry: Nat \union {Nil}]  \* The last recoverable entry set to the lowest negative
+                                                \* recovery read - 1 
 
 \* Each client starts empty, no state
 InitClient(cid) ==
-    [id              |-> cid,
-     meta_version    |-> Nil,
-     status          |-> Nil,
-     curr_fragment   |-> Nil,
-     fragments       |-> <<>>,
-     pending_add_ops |-> {},
-     lap             |-> 0,
-     lac             |-> 0,
-     confirmed       |-> [id \in EntryIds |-> {}],
-     fenced          |-> {},
-     curr_read_entry |-> Nil,
-     read_responses  |-> {},
-     recovery_phase  |-> 0]
+    [id                     |-> cid,
+     meta_version           |-> Nil,
+     status                 |-> Nil,
+     curr_fragment          |-> Nil,
+     fragments              |-> <<>>,
+     pending_add_ops        |-> {},
+     lap                    |-> 0,
+     lac                    |-> 0,
+     confirmed              |-> [id \in EntryIds |-> {}],
+     fenced                 |-> {},
+     recovery_ensemble      |-> {},
+     curr_read_entry        |-> Nil,
+     read_responses         |-> {},
+     recovery_phase         |-> 0,
+     last_recoverable_entry |-> Nil]
 
 (***************************************************************************)
 (* Fragment Helpers                                                        *)
@@ -182,12 +188,6 @@ SelectEnsemble(include_bookies, exclude_bookies) ==
 HasQuorumCoverage(s) ==
     Cardinality(s) >= ((WriteQuorum - AckQuorum) + 1)
     
-(* A more complex way of checking quorum coverage   
-QuorumCoverageAlt(quorum_that_satisifies_prop, ensemble) ==
-    \A ack_quorum \in { s \in SUBSET ensemble : Cardinality(s) = AckQuorum } :
-        quorum_that_satisifies_prop \intersect ack_quorum # {}
-*)       
-
 (***************************************************************************)
 (* ACTION: Create ledger                                                   *)
 (*                                                                         *)
@@ -239,12 +239,14 @@ SendAddEntryRequests(c, entry) ==
                                                  ensemble    |-> c.curr_fragment.ensemble]}]]
 
 ClientSendsAddEntryRequests(cid) ==
-    /\ clients[cid].status = STATUS_OPEN
-    /\ LET entry_data == clients[cid].lap + 1
-       IN
-        /\ entry_data <= SendLimit
-        /\ SendAddEntryRequests(clients[cid], [id   |-> entry_data, data |-> entry_data])
-    /\ UNCHANGED << bookie_vars, meta_vars >>
+    LET c == clients[cid]
+    IN
+        /\ c.status = STATUS_OPEN
+        /\ LET entry_data == c.lap + 1
+           IN
+            /\ entry_data <= SendLimit
+            /\ SendAddEntryRequests(c, [id   |-> entry_data, data |-> entry_data])
+        /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************)
 (* ACTION: A bookie receives an AddEntryRequestMessage, Sends a confirm.   *)
@@ -531,6 +533,8 @@ ClientClosesLedgerSuccess(cid) ==
 (* interactions with this ledger (we do not model a stalled recovery).     *)
 (***************************************************************************)
 
+\* DISABLING THIS REDUCES THE STATE SPACE, CAN UNCOMMENT TO INCLUDE IT
+
 ClientClosesLedgerFail(cid) ==
     /\ clients[cid].meta_version # meta_version
     /\ clients[cid].status = STATUS_OPEN
@@ -559,11 +563,12 @@ ClientStartsRecovery(cid) ==
     /\ meta_status' = STATUS_IN_RECOVERY
     /\ meta_version' = meta_version + 1
     /\ clients' = [clients EXCEPT ![cid] =
-                            [@ EXCEPT !.status         = STATUS_IN_RECOVERY,
-                                      !.meta_version   = meta_version + 1,
-                                      !.recovery_phase = FencingPhase,
-                                      !.fragments      = meta_fragments,
-                                      !.curr_fragment  = Last(meta_fragments)]]
+                            [@ EXCEPT !.status            = STATUS_IN_RECOVERY,
+                                      !.meta_version      = meta_version + 1,
+                                      !.recovery_phase    = FencingPhase,
+                                      !.fragments         = meta_fragments,
+                                      !.curr_fragment     = Last(meta_fragments),
+                                      !.recovery_ensemble = Last(meta_fragments).ensemble]]
     /\ SendMessagesToEnsemble(GetFencedReadLacRequests(clients[cid], Last(meta_fragments).ensemble))
     /\ UNCHANGED << bookie_vars, meta_fragments, meta_last_entry >>
 
@@ -596,14 +601,10 @@ BookieSendsFencingReadLacResponse ==
 (* Once the read phase has started any late arriving LAC reads are ignored.*)
 (***************************************************************************)
 
-NotStartedReadPhase ==
-    ~\E msg \in DOMAIN messages :
-        msg.type = ReadRequestMessage
-
 ClientReceivesFencingReadLacResponse(cid) ==
     LET c == clients[cid]
-    IN
-        \E msg \in DOMAIN messages :
+    IN /\ c.recovery_phase = FencingPhase \* we can ignore any late responses after 
+       /\ \E msg \in DOMAIN messages :
             /\ msg.cid = cid
             /\ ReceivableMessageOfType(messages, msg, FenceResponseMessage)
             /\ LET lac == IF msg.lac > c.curr_fragment.first_entry_id - 1
@@ -612,12 +613,8 @@ ClientReceivesFencingReadLacResponse(cid) ==
                IN
                 /\ clients' = [clients EXCEPT ![cid] = 
                                     [@ EXCEPT !.fenced = @ \union {msg.bookie},
-                                              !.lac = IF NotStartedReadPhase /\ (c.lac = Nil \/ lac > c.lac)
-                                                      THEN lac
-                                                      ELSE @,
-                                              !.lap = IF NotStartedReadPhase /\ (c.lac = Nil \/ lac > c.lac)
-                                                      THEN lac
-                                                      ELSE @]]
+                                              !.lac = IF lac > @ THEN lac ELSE @,
+                                              !.lap = IF lac > @ THEN lac ELSE @]]
                 /\ MessageProcessed(msg)
                 /\ UNCHANGED << bookie_vars, meta_vars >>
 
@@ -625,8 +622,15 @@ ClientReceivesFencingReadLacResponse(cid) ==
 (* ACTION: Recovery client sends a recovery read request to each bookie.   *)
 (*                                                                         *)
 (* The recovery client sends a ReadRequestMessage to each bookie of the    *)
-(* current ensemble once every ack quorum has at least one fenced bookie.  *)
-(* Recovery reads set the fencing flag.                                    *)
+(* recovery read ensemble once every ack quorum has at least one fenced    *)
+(* bookie. Recovery reads set the fencing flag.                            *)
+(*                                                                         *)
+(* It is important to remember that recovery reads get sent to the         *)
+(* ensemble of the last fragment at the time recovery started - called the *)
+(* recovery read ensemble in this spec. If reads get sent to the current   *)
+(* ensemble then ensemble changes resulting from recovery writes can cause *)
+(* reads to be sent to bookies that do not have the entries and the result *)
+(* would be ledger truncation.                                             *)
 (*                                                                         *)
 (* NOTE1: Remember that entry ids start at 1 in this spec as TLA+ is base 1*)
 (***************************************************************************)
@@ -642,16 +646,17 @@ ClientSendsRecoveryReadRequests(cid) ==
     LET c == clients[cid]
     IN
         /\ c.status = STATUS_IN_RECOVERY
-        /\ \/ c.recovery_phase = ReadPhase
+        /\ \/ /\ c.recovery_phase = ReadWritePhase
+              /\ c.last_recoverable_entry = Nil
+              /\ c.curr_read_entry = Nil
            \/ /\ c.recovery_phase = FencingPhase
               /\ HasQuorumCoverage(c.fenced) 
-        /\ c.curr_read_entry = Nil
         /\ LET next_entry_id == c.lap+1
            IN
-            /\ clients' = [clients EXCEPT ![c.id] = [c EXCEPT !.recovery_phase = ReadPhase,
-                                                              !.curr_read_entry = next_entry_id]]
-            /\ SendMessagesToEnsemble(GetRecoveryReadRequests(c, next_entry_id, 
-                                                              FragmentOfEntryId(next_entry_id, c.fragments).ensemble))
+            /\ clients' = [clients EXCEPT ![c.id] = [c EXCEPT !.recovery_phase  = ReadWritePhase,
+                                                              !.curr_read_entry = next_entry_id,
+                                                              !.fenced          = {}]] \* fenced no longer needed to reset
+            /\ SendMessagesToEnsemble(GetRecoveryReadRequests(c, next_entry_id, c.recovery_ensemble))
             /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************)
@@ -713,62 +718,55 @@ ReadStatus(c, responses) ==
          THEN NoSuchEntry
          ELSE \* all responses in and neither positive nor negative threshold reached
               IF Cardinality(responses) 
-                + ReadTimeoutCount(c.id, c.curr_fragment.ensemble, TRUE) = WriteQuorum
+                + ReadTimeoutCount(c.id, c.recovery_ensemble, TRUE) = WriteQuorum
               THEN Unknown
               ELSE NeedMoreResponses
 
-ReadPositive(c, msg, responses, read_ensemble) ==
+ReadPositive(c, msg, responses) ==
     /\ clients' = [clients EXCEPT ![c.id] = 
                         [c EXCEPT !.curr_read_entry = Nil, \* reset for next read
                                   !.read_responses  = {},  \* reset for next read
-                                  !.fenced          = IF msg.fence = TRUE THEN @ \union {msg.bookie} ELSE @,
                                   !.lap             = @ + 1,
                                   !.pending_add_ops = @ \union {[entry       |-> [id   |-> c.lap + 1,
                                                                                   data |-> msg.entry.data],
                                                                  fragment_id |-> c.curr_fragment.id,
                                                                  ensemble    |-> c.curr_fragment.ensemble]}]]
-    /\ IgnoreFurtherReadResponses(msg, read_ensemble)
+    /\ IgnoreFurtherReadResponses(msg, c.recovery_ensemble)
       
-ReadNegative(c, msg, responses, read_ensemble) ==
+ReadNegative(c, msg, responses) ==
     /\ clients' = [clients EXCEPT ![c.id] = 
-                    [c EXCEPT !.curr_read_entry = Nil, \* reset to reduce state space
-                              !.read_responses  = {}, \* reset to reduce state space
-                              !.fenced          = IF msg.fence = TRUE
-                                                  THEN @ \union {msg.bookie}
-                                                  ELSE @,
-                              !.recovery_phase  = WritePhase]]
-    /\ IgnoreFurtherReadResponses(msg, read_ensemble)
+                    [c EXCEPT !.curr_read_entry        = Nil, \* reset to reduce state space
+                              !.read_responses         = {},  \* reset to reduce state space
+                              !.recovery_ensemble      = {},  \* reset to reduce state space
+                              !.last_recoverable_entry = msg.entry.id - 1]]
+    /\ IgnoreFurtherReadResponses(msg, c.recovery_ensemble)
     
-ReadUnknown(c, msg, responses, read_ensemble) ==
+ReadUnknown(c, msg, responses) ==
     /\ clients' = [clients EXCEPT ![c.id] = 
                     [c EXCEPT !.status = RECOVERY_ABORTED,
-                              !.curr_read_entry = Nil, \* reset to reduce state space
-                              !.read_responses  = {}, \* reset to reduce state space
-                              !.fenced          = IF msg.fence = TRUE
-                                                  THEN @ \union {msg.bookie}
-                                                  ELSE @]]
-    /\ IgnoreFurtherReadResponses(msg, read_ensemble)
+                              !.curr_read_entry   = Nil, \* reset to reduce state space
+                              !.read_responses    = {},  \* reset to reduce state space
+                              !.recovery_ensemble = {}]] \* reset to reduce state space
+    /\ IgnoreFurtherReadResponses(msg, c.recovery_ensemble)
     
 NotEnoughReadResponses(c, msg, responses) ==
     clients' = [clients EXCEPT ![c.id] = 
-                    [c EXCEPT !.read_responses = responses, 
-                              !.fenced         = IF msg.fence = TRUE
-                                                 THEN @ \union {msg.bookie}
-                                                 ELSE @]]    
+                    [c EXCEPT !.read_responses = responses]]    
     
 ClientReceivesRecoveryReadResponse(cid) ==
     LET c == clients[cid]
-    IN
-        \E msg \in DOMAIN messages :
+    IN /\ c.status = STATUS_IN_RECOVERY
+       /\ c.recovery_phase = ReadWritePhase
+       /\ \E msg \in DOMAIN messages :
             /\ msg.cid = cid
             /\ ReceivableMessageOfType(messages, msg, ReadResponseMessage)
-            /\ msg.entry.id = c.curr_read_entry \* ignore any responses not of the current read
+            /\ msg.entry.id = c.curr_read_entry \* we can ignore any responses not of the current read
             /\ LET read_responses == c.read_responses \union {msg}
                    read_status == ReadStatus(c, read_responses)
                IN
-                  /\ CASE read_status = OK -> ReadPositive(c, msg, read_responses, c.curr_fragment.ensemble)
-                      [] read_status = NoSuchEntry -> ReadNegative(c, msg, read_responses, c.curr_fragment.ensemble)
-                      [] read_status = Unknown -> ReadUnknown(c, msg, read_responses, c.curr_fragment.ensemble)
+                  /\ CASE read_status = OK -> ReadPositive(c, msg, read_responses)
+                      [] read_status = NoSuchEntry -> ReadNegative(c, msg, read_responses)
+                      [] read_status = Unknown -> ReadUnknown(c, msg, read_responses)
                       [] read_status = NeedMoreResponses -> NotEnoughReadResponses(c, msg, read_responses)
                   /\ MessageProcessed(msg)
             /\ UNCHANGED << bookie_vars, meta_vars >>
@@ -779,7 +777,7 @@ ClientReceivesRecoveryReadResponse(cid) ==
 (* Recovery writes follow the same logic as replication writes, in that    *)
 (* they can involve the creation of new fragments. Also note that all      *)
 (* entries are written to the current fragment, not necessarily the        *)
-(* fragment they were read from.                                           *)
+(* fragment they were read from (recovery_ensemble).                       *)
 (***************************************************************************)
 
 NotSentWrite(c, op) ==
@@ -793,7 +791,7 @@ ClientWritesBackEntry(cid) ==
     LET c == clients[cid]
     IN
         /\ c.status = STATUS_IN_RECOVERY
-        /\ c.recovery_phase = WritePhase
+        /\ c.recovery_phase = ReadWritePhase
         /\ \E op \in c.pending_add_ops :
             /\ NotSentWrite(c, op)
             /\ ~\E op2 \in c.pending_add_ops :
@@ -822,15 +820,16 @@ RecoveryClientClosesLedger(cid) ==
         /\ meta_version = c.meta_version
         /\ meta_status = STATUS_IN_RECOVERY
         /\ c.status = STATUS_IN_RECOVERY
-        /\ c.recovery_phase = WritePhase
+        /\ c.recovery_phase = ReadWritePhase
+        /\ c.last_recoverable_entry # Nil
         /\ Cardinality(c.pending_add_ops) = 0
         /\ clients' = [clients EXCEPT ![c.id] = 
                                 [c EXCEPT !.status = STATUS_CLOSED,
                                           !.meta_version = @ + 1]]
         /\ meta_version' = meta_version + 1
-        /\ meta_fragments = c.fragments
+        /\ meta_fragments' = c.fragments
         /\ meta_status' = STATUS_CLOSED
-        /\ meta_last_entry' = c.lac
+        /\ meta_last_entry' = c.last_recoverable_entry
         /\ UNCHANGED << bookie_vars, meta_fragments, messages >>
 
 (***************************************************************************)
@@ -959,5 +958,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Nov 22 11:52:02 CET 2021 by GUNMETAL
+\* Last modified Sat Nov 27 16:55:45 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly
