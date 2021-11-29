@@ -13,8 +13,10 @@ CONSTANTS Bookies,                      \* The bookies available e.g. { B1, B2, 
           AckQuorum,                    \* The number of bookies that must confirm an entry for the
                                         \* client to acknowledge to its own client, also the minimum
                                         \* replication factor (can occur in scenarios such as ensemble change or ledger closes)
-          SendLimit                     \* The data items to send. Limited to a very small number of data items
+          SendLimit,                    \* The data items to send. Limited to a very small number of data items
                                         \* in order to keep the state space small. E.g 1 or 2
+          InflightLimit                 \* Limit the number of unacknowledged add entry requests by the client
+                                        \* which can reduce to state space significantly
 
 \* Model values
 CONSTANTS Nil,
@@ -242,6 +244,7 @@ ClientSendsAddEntryRequests(cid) ==
     LET c == clients[cid]
     IN
         /\ c.status = STATUS_OPEN
+        /\ c.lap - c.lac <= InflightLimit - 1 \* configurable state space reduction
         /\ LET entry_data == c.lap + 1
            IN
             /\ entry_data <= SendLimit
@@ -466,6 +469,10 @@ RecoveryClientChangesEnsemble(cid) ==
 (* both.                                                                   *)
 (***************************************************************************)
 
+NeedsResend(op, curr_fragment) ==
+    \/ op.fragment_id # curr_fragment.id
+    \/ op.ensemble # curr_fragment.ensemble
+
 \* update the pending add op ensemble
 SetNewEnsemble(c, pending_op) ==
     {
@@ -476,12 +483,11 @@ SetNewEnsemble(c, pending_op) ==
         ELSE op : op \in c.pending_add_ops
     }
 
-\* send the add to any bookies in the new ensemble that are not in the original
+\* resend an add to any bookies in the new ensemble that are not in the original
 \* then update the op with the new ensemble.
-SendPendingAddOp(c, is_recovery) ==
+ResendPendingAddOp(c, is_recovery) ==
     /\ \E op \in c.pending_add_ops :
-        /\ \/ op.fragment_id # c.curr_fragment.id
-           \/ op.ensemble # c.curr_fragment.ensemble
+        /\ NeedsResend(op, c.curr_fragment)
         /\ ~\E op2 \in c.pending_add_ops :
             /\ op2.fragment_id = op.fragment_id
             /\ op2.ensemble = op.ensemble
@@ -495,14 +501,14 @@ SendPendingAddOp(c, is_recovery) ==
               /\ clients' = [clients EXCEPT ![c.id] = 
                                 [c EXCEPT !.pending_add_ops = SetNewEnsemble(c, op)]]
 
-ClientSendsPendingAddOp(cid) ==
+ClientResendsPendingAddOp(cid) ==
     /\ clients[cid].status = STATUS_OPEN
-    /\ SendPendingAddOp(clients[cid], FALSE)
+    /\ ResendPendingAddOp(clients[cid], FALSE)
     /\ UNCHANGED << bookie_vars, meta_vars >>
 
 RecoveryClientSendsPendingAddOp(cid) ==
     /\ clients[cid].status = STATUS_IN_RECOVERY
-    /\ SendPendingAddOp(clients[cid], TRUE)
+    /\ ResendPendingAddOp(clients[cid], TRUE)
     /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************)
@@ -830,7 +836,7 @@ RecoveryClientClosesLedger(cid) ==
         /\ meta_fragments' = c.fragments
         /\ meta_status' = STATUS_CLOSED
         /\ meta_last_entry' = c.last_recoverable_entry
-        /\ UNCHANGED << bookie_vars, meta_fragments, messages >>
+        /\ UNCHANGED << bookie_vars, messages >>
 
 (***************************************************************************)
 (* Initial and Next state                                                  *)
@@ -860,7 +866,7 @@ Next ==
         \/ ClientReceivesAddConfirmedResponse(cid)
         \/ ClientReceivesAddFencedResponse(cid)
         \/ ClientChangesEnsemble(cid)
-        \/ ClientSendsPendingAddOp(cid)
+        \/ ClientResendsPendingAddOp(cid)
         \/ ClientClosesLedgerSuccess(cid)
         \/ ClientClosesLedgerFail(cid)
         \* recovery clients
@@ -958,5 +964,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Nov 27 16:55:45 CET 2021 by GUNMETAL
+\* Last modified Sun Nov 28 09:15:31 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly
