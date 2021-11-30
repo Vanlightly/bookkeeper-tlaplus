@@ -8,9 +8,15 @@ EXTENDS Naturals, FiniteSets, Sequences, Integers, TLC
         - fencing cohort = current ensemble
         - recovery read cohort = entry writeset
         
-    The 4 methods can be classified as either:
+    The 4 definitions can be classified as either:
     - measuring the set of bookies that satisfy a property (1st and 2nd)
-    - measuring the set of bookies that do not satisfy a property (3rd and 4th)        
+    - measuring the set of bookies that do not satisfy a property (3rd and 4th)
+    
+    Definitions:
+    - Affirmative 1: (cohort size - AQ) + 1 bookies satisfy the property
+    - Affirmative 2: at least 1 bookie in every ack quorum of bookies satisfies the property
+    - Non-affirmative 1: less than AQ bookies do not satisfy the property
+    - Non-affirmative 2: there exists no AQ of bookies that do not satisfy the property
 *)
 
 HasQuorumCoverageUsingAffirmative(satisifies_prop, cohort_size, aq) ==
