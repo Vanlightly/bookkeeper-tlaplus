@@ -1040,10 +1040,14 @@ has indeed reached Ack Quorum and therefore committed.
 ****************************************************************************)
 NoDirtyReads ==
     \A b \in Bookies :
-        \/ b_lac[b] = 0
+        \/ b_lac[b] = 0 \* we only care about bookies with LAC > 0
         \/ /\ b_lac[b] > 0
-           /\ Quantify(FragmentOfEntryId(b_lac[b], meta_fragments), 
-                LAMBDA bk : \E e \in b_entries[bk] : e.id = b_lac[b]) >= AckQuorum         
+           /\ LET ensemble == FragmentOfEntryId(b_lac[b], meta_fragments).ensemble
+              IN
+                \/ b \notin ensemble \* we only care about bookies in the ensemble
+                \/ /\ b \in ensemble
+                   /\ Quantify(ensemble, 
+                        LAMBDA bk : \E e \in b_entries[bk] : e.id = b_lac[b]) >= AckQuorum         
 
 (***************************************************************************
 Invariant: All committed entries reach Ack Quorum                       
@@ -1099,5 +1103,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Nov 30 12:05:50 CET 2021 by GUNMETAL
+\* Last modified Wed Dec 01 09:35:06 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly
