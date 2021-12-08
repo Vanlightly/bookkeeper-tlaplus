@@ -1,16 +1,36 @@
-------------------------- MODULE BookKeeperProtocol -------------------------
+------------------------- MODULE BookKeeperProtocolGuaranteedWriteQuorum -------------------------
 EXTENDS MessagePassing, Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
 (*
-This specification formally describes the BookKeeper protocol. It describes it
-both in prose (in the comments) and formally in TLA+. The scope of the specification
-is the lifetime of a single ledger.
+This is a modified specification of the BookKeeper protocol that contains the following changes:
+1. A pending add op is only removed once it has reached WQ and its entire prefix has reached WQ.
+   Original: a pending add op was removed once it and its prefix had reached AQ.
+2. Ensemble changes brings all entries starting at the lowest entry not to reach WQ into the next
+   fragment. This translates to taking all pending add ops into the next fragment and setting the
+   first entry id of the fragment to the lowest entry brought forward.
+   Original: Only take uncommitted entries into the next fragment i.e. the entries starting at the lowest entry
+   that had not reached AQ. This also translated to taking all pending add ops, and setting the first
+   entry id of the fragment to LAC+1.
+3. Bookies that are in the ack set of a pending add op are pinned and cannot be swapped out in
+   an ensemble change.
+   Original: committed entries were not included in ensemble changes and so pinning was not necessary.
+4. Clients only close their own ledger once all committed entries have reached WQ (and therefore
+   there are no pending add ops).
+   Before a client could close a ledger immediately.
+5. Recovery clients complete recovery once reads are complete and all writes have reached WQ. This translates
+   to all reads done and all pending add ops have been completed. 
+   Original: recovery completed once all reads were complete and all adds were committed. This change actually
+   requires no changes to the spec as we already only complete once all pending add ops were completed/
+6. Recovery reads start at the Last Add Fully Replicated (LAFR) + 1. Else if we start at the LAC+1, we might leave some
+   entries at only AQ.   
 
-Currently not modelled:
-- regular reads (including long poll reads), but we have invariants that cover readability.
-- Ensemble /= Write Quorum. Striping is not modelled in this spec but the correct cohorts
-  for things like fencing and recovery reads are modelled. So adding an explicit ensemble
-  size would be possible.
+Changes 1-3 give us the invariant that all entries in all but the last fragment reach WQ.
+Change 4 gives us the invariant that all entries in final fragment of closed ledgers that were closed by the owner client have reached WQ.
+Change 5-6 gives us the invariant that all entries in final fragment of closed ledgers that were recovered have reached WQ.
+
+NEW INVARIANTS
+- TailFragmentsReachWriteQuorum
+- AllEntriesOfClosedLedgerReachedWriteQuorum
 *)
 
 \* Input parameters
@@ -46,7 +66,8 @@ VARIABLES meta_status,              \* the ledger status
 \* Bookie state (each is a function whose domain is the set of bookies) pertaining to this single ledger
 VARIABLES b_entries,                \* the entries stored in each bookie
           b_fenced,                 \* the fenced status of the ledger on each bookie (TRUE/FALSE)
-          b_lac                     \* the last add confirmed of the ledger on each bookie
+          b_lac,                    \* the last add confirmed of the ledger on each bookie
+          b_lafr                    \* the last add fully replicated of the ledger on each bookie
 
 \* the state of the clients
 VARIABLES clients                   \* the set of BookKeeper clients
@@ -59,7 +80,7 @@ ASSUME AckQuorum \in Nat
 ASSUME AckQuorum > 0
 ASSUME WriteQuorum >= AckQuorum
 
-bookie_vars == << b_fenced, b_entries, b_lac >>
+bookie_vars == << b_fenced, b_entries, b_lac, b_lafr >>
 meta_vars == << meta_status, meta_fragments, meta_last_entry, meta_version >>
 vars == << bookie_vars, clients, meta_vars, messages >>
 
@@ -106,6 +127,7 @@ ClientState ==
      pending_add_ops: SUBSET PendingAddOp,      \* The pending add operations of a client
      lap: Nat,                                  \* The Last Add Pushed of a client
      lac: Nat,                                  \* The Last Add Confirmed of a client
+     lafr: Nat,                                 \* The Last Add Fully Replicated of a client
      confirmed: [EntryIds -> SUBSET Bookies],   \* The bookies that have confirmed each entry id
      fenced: SUBSET Bookies,                    \* The bookies that have confirmed they are fenced to this client
      \* ledger recovery only
@@ -127,6 +149,7 @@ InitClient(cid) ==
      pending_add_ops        |-> {},
      lap                    |-> 0,
      lac                    |-> 0,
+     lafr                   |-> 0,
      confirmed              |-> [id \in EntryIds |-> {}],
      fenced                 |-> {},
      recovery_ensemble      |-> {},
@@ -240,6 +263,7 @@ GetAddEntryRequests(c, entry, ensemble, recovery) ==
        cid      |-> c.id,
        entry    |-> entry,
        lac      |-> c.lac,
+       lafr     |-> c.lafr,
        recovery |-> recovery] : b \in ensemble }
 
 SendAddEntryRequests(c, entry) ==
@@ -292,7 +316,8 @@ BookieSendsAddConfirmedResponse ==
         /\ \/ b_fenced[msg.bookie] = FALSE
            \/ msg.recovery = TRUE
         /\ b_entries' = [b_entries EXCEPT ![msg.bookie] = @ \union {msg.entry}]
-        /\ b_lac' = [b_lac EXCEPT ![msg.bookie] = msg.lac]
+        /\ b_lac' = [b_lac EXCEPT ![msg.bookie] = IF msg.lac > @ THEN msg.lac ELSE @]
+        /\ b_lafr' = [b_lafr EXCEPT ![msg.bookie] = IF msg.lafr > @ THEN msg.lafr ELSE @]
         /\ ProcessedOneAndSendAnother(msg, GetAddEntryResponse(msg, TRUE))
         /\ UNCHANGED << b_fenced, clients, meta_vars >>
 
@@ -318,39 +343,47 @@ ACTION: A client receive a success AddEntryResponseMessage
 A client receives a success AddEntryResponseMessage and adds the bookie 
 to the list of bookies that have acknowledged the entry.                
 It may also:                                                            
- - advance the LAC.                                                      
- - remove pending add ops that are equal to or lower than the new LAC    
+ - advance the LAC.
+ - advance the LAFR.
+ - remove pending add ops that are equal to or lower than the new LAFR    
 
 Key points:
 - When the LAC is advanced, it advances to the highest entry that:
     1. has reached Ack Quorum
     2. ALL prior entries have also reached ack quorum.
+- When the LAFR is advanced, it advances to the highest entry that:
+    1. has reached Write Quorum
+    2. ALL prior entries have also reached write quorum.    
 - Implicit in this spec is that once the LAC is advanced, any entries it
   passes or reaches is acknowledged back to the caller.
 - The client could be the original client or it could be a recovery client
-  writing back entries during the recovery read/write phase.  
+  writing back entries during the recovery read/write phase.
+TWEAKS:
+- Only remove an entries when they have reached WQ and their entire prefix
+  has also reached WQ. (CHANGE 1)
+- No change to LAC at all.
 ****************************************************************************)
-
-\* TODO: ensemble change would have to take the lowest PendingAddOp entry id
 
 AddToConfirmed(c, entry_id, bookie) ==
     [c.confirmed EXCEPT ![entry_id] = @ \union {bookie}]
 
 \* Only remove if it has reached the Ack Quorum and <= LAC
-MayBeRemoveFromPending(c, confirmed, lac) ==
-    { op \in c.pending_add_ops :
-        \/ Cardinality(confirmed[op.entry.id]) < AckQuorum
-        \/ op.entry.id > lac
-    }
+UpdatedPendingAddOps(c, lwq) ==
+    { op \in c.pending_add_ops : op.entry.id > lwq }
 
-MaxContiguousConfirmedEntry(confirmed) ==
+\* choose an entry that reached the desired quorum and whose entire prefix
+\* has also reached that quorum. Note, we need the "if exists" first else
+\* choose will fail if there is no such entry. 
+MaxContiguousEntryAtQuorum(confirmed, quorum) ==
     IF \E id \in DOMAIN confirmed : \A id1 \in 1..id :
-                                        Cardinality(confirmed[id1]) >= AckQuorum
-    THEN Max({id \in DOMAIN confirmed :
-                \A id1 \in 1..id :
-                    Cardinality(confirmed[id1]) >= AckQuorum
-             })
-    ELSE 0
+                                        Cardinality(confirmed[id1]) >= quorum
+    THEN 
+        CHOOSE id \in DOMAIN confirmed : 
+            /\ \A id1 \in 1..id : Cardinality(confirmed[id1]) >= quorum
+            /\ ~\E other_id \in DOMAIN confirmed :
+                /\ other_id > id 
+                /\ \A other_id1 \in 1..other_id : Cardinality(confirmed[other_id1]) >= quorum
+    ELSE 0       
 
 ReceiveAddConfirmedResponse(c, is_recovery) ==
     \E msg \in DOMAIN messages :
@@ -361,12 +394,14 @@ ReceiveAddConfirmedResponse(c, is_recovery) ==
         /\ msg.success = TRUE
         /\ msg.bookie \in c.curr_fragment.ensemble
         /\ LET confirmed == AddToConfirmed(c, msg.entry.id, msg.bookie)
-           IN LET lac == MaxContiguousConfirmedEntry(confirmed)
+           IN LET lac  == MaxContiguousEntryAtQuorum(confirmed, AckQuorum)
+                  lafr == MaxContiguousEntryAtQuorum(confirmed, WriteQuorum)
               IN
                 clients' = [clients EXCEPT ![c.id] = 
-                                        [c EXCEPT !.confirmed = confirmed,
-                                                  !.lac = IF lac > @ THEN lac ELSE @,
-                                                  !.pending_add_ops = MayBeRemoveFromPending(c, confirmed, lac)]]
+                                        [c EXCEPT !.confirmed       = confirmed,
+                                                  !.lac             = IF lac > @ THEN lac ELSE @,
+                                                  !.lafr            = IF lafr > @ THEN lafr ELSE @,
+                                                  !.pending_add_ops = UpdatedPendingAddOps(c, lafr)]]
         /\ MessageProcessed(msg)
 
 
@@ -419,11 +454,10 @@ not cause ensemble changes.
           
 The client:                                                             
  - opens a new fragment with a new ensemble, with its first entry id    
-   being LAC + 1. Basically all uncommitted entries.
- - the failed bookie is removed from the confirmed set of any 
-   non-committed entries. For entries that have Ack Quorum but
-   are ahead of the LAC, and therefore not committed, this can 
-   reduce them back down to below AckQuorum.
+   being LAFR + 1.
+ - the failed bookie is removed from the confirmed set of any pending add ops.
+   For entries that have Ack Quorum but are ahead of the LAC, and therefore 
+   not committed, this can reduce them back down to below AckQuorum.
  - if the lowest uncommitted entry id is the same as the current fragment,
    then the current fragment gets overwritten, else a new fragment is
    appended.                                                       
@@ -457,12 +491,33 @@ Key points:
   2. if two clients attempt recovery concurrently, they can affect each other
      by changing the fragments so they direct recovery reads to bookies that
      were not in the original fragment and therefore cause ledger truncation.
+
+TWEAKS:
+- All entries, starting at the lowest entry that has not reached WQ is moved
+  into the next fragment. (CHANGE 2)
+- Bookies that are in the ack set of a pending add op that is committed are 
+  pinned. Pinned bookies cannot be replaced in ensemble changes. Any write
+  failures to pinned bookies must be delayed until the relevant committed
+  have reached WQ. (CHANGE 3)
 ****************************************************************************)
+
+\* if the lowest entry brought forward is higher than the LAC then no bookies
+\* can be pinned. If the bookie is in the confirmed set of a committed entry
+\* that is being brought into the next fragment, then it is pinned.
+BookiePinned(c, bookie, first_entry_id) ==
+    IF first_entry_id > c.lac
+    THEN FALSE
+    ELSE \E e \in first_entry_id..c.lac :
+            bookie \in c.confirmed[e]
 
 NoPendingResends(c) ==
     ~\E op \in c.pending_add_ops :
         /\ \/ op.fragment_id # c.curr_fragment.id
            \/ op.ensemble # c.curr_fragment.ensemble
+
+\* The next fragment is only valid if it's first_entry_id is equal to or higher than all existing fragments.
+ValidNextFragment(first_entry_id) ==
+    ~\E i \in DOMAIN meta_fragments : meta_fragments[i].first_entry_id > first_entry_id
 
 \* if there already exists an ensemble with the same first_entry_id then replace it,
 \* else append a new fragment
@@ -482,8 +537,9 @@ ChangeEnsemble(c, recovery) ==
     /\ \E failed_bookies \in SUBSET c.curr_fragment.ensemble :
         /\ \A bookie \in failed_bookies : WriteTimeoutForBookie(messages, c.id, bookie, recovery)
         /\ EnsembleAvailable(c.curr_fragment.ensemble \ failed_bookies, failed_bookies)
-        /\ LET first_entry_id == c.lac + 1
+        /\ LET first_entry_id == c.lafr + 1
            IN
+              /\ \A bookie \in failed_bookies : ~BookiePinned(c, bookie, first_entry_id)
               /\ LET new_ensemble   == SelectEnsemble(c.curr_fragment.ensemble \ failed_bookies, failed_bookies)
                      updated_fragments == UpdatedFragments(c, first_entry_id, new_ensemble)
                  IN
@@ -577,19 +633,27 @@ ACTION: A client closes its own ledger.
 The original client decides to close its ledger. The metadata store still        
 has the ledger as OPEN and the version matches so the close succeeds.                           
 A close can be performed at any time.
+
+TWEAKS:
+- the client can only close a ledger once all pending add ops are completed
+  (meaning they have reached WQ). If any write fails then ensemble changes
+  will occur until the entry reached WQ. (CHANGE 4)
 ***************************************************************************)
 
 ClientClosesLedgerSuccess(cid) ==
-    /\ clients[cid].meta_version = meta_version
-    /\ clients[cid].status = STATUS_OPEN
-    /\ meta_status = STATUS_OPEN
-    /\ clients' = [clients EXCEPT ![cid] = 
-                        [@ EXCEPT !.meta_version = @ + 1,
-                                  !.status = STATUS_CLOSED]]
-    /\ meta_status' = STATUS_CLOSED
-    /\ meta_last_entry' = clients[cid].lac
-    /\ meta_version' = meta_version + 1
-    /\ UNCHANGED << bookie_vars, meta_fragments, messages >>
+    LET c == clients[cid]
+    IN
+        /\ c.meta_version = meta_version
+        /\ c.status = STATUS_OPEN
+        /\ meta_status = STATUS_OPEN
+        /\ Cardinality(c.pending_add_ops) = 0
+        /\ clients' = [clients EXCEPT ![cid] = 
+                            [@ EXCEPT !.meta_version = @ + 1,
+                                      !.status = STATUS_CLOSED]]
+        /\ meta_status' = STATUS_CLOSED
+        /\ meta_last_entry' = clients[cid].lac
+        /\ meta_version' = meta_version + 1
+        /\ UNCHANGED << bookie_vars, meta_fragments, messages >>
 
 (***************************************************************************
 ACTION: A client fails to close its own ledger.                         
@@ -612,15 +676,18 @@ ClientClosesLedgerFail(cid) ==
 ACTION: A client starts ledger recovery.                                 
 
 A recovery client decides to start the recovery process for the ledger. 
-It changes the meta status to IN_RECOVERY and sends a fencing read LAC     
+It changes the meta status to IN_RECOVERY and sends a fencing read LAFR     
 request to each bookie in the current ensemble. 
 
 Key points:
 - why a client initiates recovery is outside of this the scope of spec 
-  and from a correctness point of view, irrelevant.                        
+  and from a correctness point of view, irrelevant.
+
+TWEAKS:  
+- we now send LAFR not LAC requests (change 6)
 ****************************************************************************)
 
-GetFencedReadLacRequests(c, ensemble) ==
+GetFencedReadLafrRequests(c, ensemble) ==
     { [type   |-> FenceRequestMessage,
        bookie |-> bookie,
        cid    |-> c.id] : bookie \in ensemble }
@@ -637,14 +704,14 @@ ClientStartsRecovery(cid) ==
                                       !.fragments         = meta_fragments,
                                       !.curr_fragment     = Last(meta_fragments),
                                       !.recovery_ensemble = Last(meta_fragments).ensemble]]
-    /\ SendMessagesToEnsemble(GetFencedReadLacRequests(clients[cid], Last(meta_fragments).ensemble))
+    /\ SendMessagesToEnsemble(GetFencedReadLafrRequests(clients[cid], Last(meta_fragments).ensemble))
     /\ UNCHANGED << bookie_vars, meta_fragments, meta_last_entry >>
 
 (***************************************************************************
-ACTION: A bookie receives a fencing LAC request, sends a response.       
+ACTION: A bookie receives a fencing LAFR request, sends a response.       
 
-A bookie receives a fencing read LAC request and sends back a success   
-response with its LAC.
+A bookie receives a fencing read LAFR request and sends back a success   
+response with its LAFR.
 
 Key points:
 - fencing works even if the bookie has never seen this ledger. If a bookie
@@ -654,50 +721,53 @@ Key points:
   the original client could in the future still write to it.                         
 ****************************************************************************)
 
-GetFencingReadLacResponseMessage(msg) ==
+GetFencingReadLafrResponseMessage(msg) ==
     [type   |-> FenceResponseMessage,
      bookie |-> msg.bookie,
      cid    |-> msg.cid,
-     lac    |-> b_lac[msg.bookie]]
+     lafr   |-> b_lafr[msg.bookie]]
 
-BookieSendsFencingReadLacResponse ==
+BookieSendsFencingReadLafrResponse ==
     \E msg \in DOMAIN messages :
         /\ ReceivableMessageOfType(messages, msg, FenceRequestMessage)
         /\ b_fenced' = [b_fenced EXCEPT ![msg.bookie] = TRUE]
-        /\ ProcessedOneAndSendAnother(msg, GetFencingReadLacResponseMessage(msg))
-        /\ UNCHANGED << b_entries, b_lac, clients, meta_vars >>
+        /\ ProcessedOneAndSendAnother(msg, GetFencingReadLafrResponseMessage(msg))
+        /\ UNCHANGED << b_entries, b_lac, b_lafr, clients, meta_vars >>
 
 (***************************************************************************
-ACTION: A recovery client receives an LAC fence response                                        
+ACTION: A recovery client receives an LAFR fence response                                        
 
 A recovery client receives a success FenceResponseMessage               
 and takes note of the bookie that confirmed its fenced status and if    
-its LAC is highest, stores it.                                          
-Once the read/write phase has started any late arriving LAC reads are ignored.
+its LAFR is highest, stores it.                                          
+Once the read/write phase has started any late arriving LAFR reads are ignored.
 
 Key points:
-- The LAC of the bookies can be stale but that is ok. The discovering the LAC
+- The LAFR of the bookies can be stale but that is ok. The discovering the LAFR
   is just an optimization to avoid having to read all entries starting at the 
   beginning of the current fragment. We don't care about any fragments prior 
   to the current one as we know those were committed.
+TWEAK:
+- we start at LAFR + 1 (CHANGE 6).  
 ****************************************************************************)
 
-ClientReceivesFencingReadLacResponse(cid) ==
+ClientReceivesFencingReadLafrResponse(cid) ==
     LET c == clients[cid]
     IN /\ c.recovery_phase = FencingPhase \* we can ignore any late responses after 
        /\ \E msg \in DOMAIN messages :
             /\ msg.cid = cid
             /\ ReceivableMessageOfType(messages, msg, FenceResponseMessage)
-            /\ LET lac == IF msg.lac > c.curr_fragment.first_entry_id - 1
-                          THEN msg.lac
-                          ELSE c.curr_fragment.first_entry_id - 1
+            /\ LET lafr == IF msg.lafr > c.curr_fragment.first_entry_id - 1
+                           THEN msg.lafr
+                           ELSE c.curr_fragment.first_entry_id - 1
                IN
                 /\ clients' = [clients EXCEPT ![cid] = 
                                     [@ EXCEPT !.fenced = @ \union {msg.bookie},
-                                              !.lac = IF lac > @ THEN lac ELSE @,
-                                              !.lap = IF lac > @ THEN lac ELSE @]]
-                /\ MessageProcessed(msg)
-                /\ UNCHANGED << bookie_vars, meta_vars >>
+                                              !.lafr = IF lafr > @ THEN lafr ELSE @,
+                                              !.lac = IF lafr > @ THEN lafr ELSE @,
+                                              !.lap = IF lafr > @ THEN lafr ELSE @]]
+            /\ MessageProcessed(msg)
+            /\ UNCHANGED << bookie_vars, meta_vars >>
 
 (***************************************************************************
 ACTION: Recovery client sends a recovery read request to each bookie.   
@@ -725,6 +795,9 @@ Key points:
 
 EXERCISE: Change the fence field in GetRecoveryReadRequests to FALSE to
           see what happens when recovery reads to not fence.
+          
+TWEAKS:
+- Recovery reads begin at the first entry of the fragment.
 ****************************************************************************)
 
 GetRecoveryReadRequests(c, entry_id, ensemble) ==
@@ -777,7 +850,7 @@ BookieSendsReadResponse ==
            THEN b_fenced' = [b_fenced EXCEPT ![msg.bookie] = TRUE]
            ELSE UNCHANGED << b_fenced >>
         /\ ProcessedOneAndSendAnother(msg, GetReadResponseMessage(msg))
-        /\ UNCHANGED << b_entries, b_lac, clients, meta_vars >>
+        /\ UNCHANGED << b_entries, b_lac, b_lafr, clients, meta_vars >>
 
 (***************************************************************************
 ACTION: Recovery client receives a read response.                                
@@ -911,7 +984,10 @@ Key points:
 - The recovery client is only able to close the ledger if the metadata store 
   still has the ledger status as IN_RECOVERY and has the same metadata version 
   as the client. Else the metadata cannot be updated and the recovery is
-  aborted. 
+  aborted.
+TWEAKS:
+- Recovery is only complete once all pending add ops are completed
+  (meaning they have reached WQ). (CHANGE 5)
 ****************************************************************************)
 
 RecoveryClientClosesLedger(cid) ==
@@ -945,13 +1021,14 @@ Init ==
     /\ b_fenced = [b \in Bookies |-> FALSE]
     /\ b_entries = [b \in Bookies |-> {}]
     /\ b_lac = [b \in Bookies |-> 0]
+    /\ b_lafr = [b \in Bookies |-> 0]
     /\ clients = [cid \in Clients |-> InitClient(cid)]
 
 Next ==
     \* Bookies
     \/ BookieSendsAddConfirmedResponse
     \/ BookieSendsAddFencedResponse
-    \/ BookieSendsFencingReadLacResponse
+    \/ BookieSendsFencingReadLafrResponse
     \/ BookieSendsReadResponse
     \/ \E cid \in Clients :
         \* original client
@@ -965,7 +1042,7 @@ Next ==
         \/ ClientClosesLedgerFail(cid)
         \* recovery clients
         \/ ClientStartsRecovery(cid)
-        \/ ClientReceivesFencingReadLacResponse(cid)
+        \/ ClientReceivesFencingReadLafrResponse(cid)
         \/ ClientSendsRecoveryReadRequests(cid)
         \/ ClientReceivesRecoveryReadResponse(cid)
         \/ ClientWritesBackEntry(cid)
@@ -1046,24 +1123,31 @@ NoDirtyReads ==
                         LAMBDA bk : \E e \in b_entries[bk] : e.id = b_lac[b]) >= AckQuorum         
 
 (***************************************************************************
-Invariant: All committed entries reach Ack Quorum                       
+Invariant: TailFragmentsReachWriteQuorum
+Invariant: AllEntriesOfClosedLedgerReachedWriteQuorum             
 
 This invariant is violated if, once a ledger is closed, there exists    
 any entry that is less than Ack Quorum replicated.                      
 NOTE: This invariant only applies if we don't model data loss in bookies.
 ****************************************************************************)
-EntryIdReachesAckQuorum(ensemble, entry_id) ==
-    Quantify(ensemble, LAMBDA b : \E e \in b_entries[b] : e.id = entry_id) >= AckQuorum
-\*    Cardinality({ b \in ensemble : \E e \in b_entries[b] : e.id = entry_id }) >= AckQuorum
+EntryIdReachesWriteQuorum(ensemble, entry_id) ==
+    Quantify(ensemble, LAMBDA b : \E e \in b_entries[b] : e.id = entry_id) >= WriteQuorum
 
-AllCommittedEntriesReachAckQuorum ==
-    IF meta_status # STATUS_CLOSED
+TailFragmentsReachWriteQuorum ==
+    IF Cardinality(DOMAIN meta_fragments) = 1
     THEN TRUE
-    ELSE IF meta_last_entry > 0
-         THEN \A id \in 1..meta_last_entry :
-                LET fragment == FragmentOfEntryId(id, meta_fragments)
-                IN EntryIdReachesAckQuorum(fragment.ensemble, id)
-         ELSE TRUE
+    ELSE \A f \in DOMAIN meta_fragments :
+        IF meta_fragments[f] = Last(meta_fragments)
+        THEN TRUE
+        ELSE \A entry_id \in meta_fragments[f].first_entry_id..meta_fragments[f+1].first_entry_id - 1 :
+            EntryIdReachesWriteQuorum(meta_fragments[f].ensemble, entry_id)
+
+AllEntriesOfClosedLedgerReachedWriteQuorum ==
+    IF meta_status = STATUS_CLOSED
+    THEN \A entry_id \in 1..meta_last_entry :
+            LET fragment == FragmentOfEntryId(entry_id, meta_fragments)
+            IN EntryIdReachesWriteQuorum(fragment.ensemble, entry_id)
+    ELSE TRUE
 
 (***************************************************************************
 Invariant: Read order matches write order                                                        
@@ -1099,5 +1183,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Wed Dec 08 17:49:00 CET 2021 by GUNMETAL
+\* Last modified Wed Dec 08 17:45:33 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly

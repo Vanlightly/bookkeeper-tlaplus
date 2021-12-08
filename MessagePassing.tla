@@ -52,9 +52,9 @@ ReadTimeoutCount(cid, ensemble, recovery) ==
     THEN Cardinality({ b \in ensemble : ReadTimeoutForBookie(messages, cid, b)})
     ELSE 0
 
-ClearWriteTimeout(cid, bookie, recovery) ==
+ClearWriteTimeout(cid, bookies, recovery) ==
     messages' = [m \in DOMAIN messages |-> IF /\ (m.type = AddEntryRequestMessage \/ m.type = AddEntryResponseMessage)
-                                              /\ m.bookie = bookie
+                                              /\ m.bookie \in bookies
                                               /\ m.cid = cid
                                               /\ m.recovery = recovery
                                               /\ messages[m] = -1
@@ -117,16 +117,29 @@ MessageProcessed(msg) ==
 ReceivableMessageOfType(msgs, msg, message_type) ==
     /\ msg.type = message_type
     /\ msgs[msg] >= 1
+    
+ReceivableRequest(msgs, msg) ==
+    /\ msg.type \in { AddEntryRequestMessage,
+                      FenceRequestMessage,
+                      ReadRequestMessage }
+    /\ msgs[msg] >= 1    
+
+ReceivableResponse(msgs, msg) ==
+    /\ msg.type \in { AddEntryResponseMessage,
+                      FenceResponseMessage,
+                      ReadResponseMessage }
+    /\ msgs[msg] >= 1 
 
 IsEarliestMsg(msg) ==
     ~\E msg2 \in DOMAIN messages :
         /\ ReceivableMessageOfType(messages, msg2, msg.type)
         /\ msg2.recovery = msg.recovery
         /\ msg2.entry.id < msg.entry.id
+        /\ msg2.cid = msg.cid
         /\ msg2.bookie = msg.bookie
 
 =============================================================================
 \* Modification History
-\* Last modified Sun Nov 21 20:05:54 CET 2021 by GUNMETAL
+\* Last modified Mon Dec 06 10:02:52 CET 2021 by GUNMETAL
 \* Last modified Mon Nov 23 09:37:09 CET 2020 by jvanlightly
 \* Created Mon Nov 23 09:19:26 CET 2020 by jvanlightly
