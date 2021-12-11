@@ -7,11 +7,11 @@ EXTENDS MessagePassingUnboundedLedgers, Naturals, FiniteSets, FiniteSetsExt, Seq
 ********************************************
 
 This is a modified specification of the BookKeeper protocol that contains the following changes:
-1. Built on the changes of the BookKeeperProtocolGuaranteedWriteQuorum spec though these changes
-   are not required for unbounded ledgers. The reason to use those changes is if you want the 
-   log tail to reach write quorum.
-   All references to LAFR for example are because of the "guaranteed WQ" changes and are not explicitly
-   linked to the Unbounder Ledgers changes.
+1. Built on the changes of the BookKeeperProtocolGuaranteedWriteQuorum spec. This Unbounded
+   Ledgers design will only be safe when used in conjunction with "guaranteed write quorum".
+   A separate design using terms is required when using the existing behaviour where only
+   ack quorum is guaranteed. If you use this design with existing AQ behaviour, there is the
+   risk of log divergence between bookies.
 
 2. Ledgers can be written to by any client, but only one client at a time. Just as in the regular
    BookKeeper protocol, it is assumed there is leader election for clients external to the protocol.
@@ -1211,5 +1211,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Thu Dec 09 20:21:29 CET 2021 by GUNMETAL
+\* Last modified Sat Dec 11 15:33:49 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly
