@@ -149,6 +149,8 @@ ClientState ==
      \* ledger recovery only
      recovery_ensemble: SUBSET Bookies,         \* The ensemble of the last fragment at the beginning of recovery
                                                 \* where all read recovery requests are sent
+     recovery_lac: Nat,                         \* The lac upon starting recovery
+     recovery_lafr: Nat,                        \* The lafr upon starting recovery
      curr_read_entry: Entry \union {Nil},       \* The entry currently being read (during recovery)
      read_responses: SUBSET ReadResponses,      \* The recovery read responses of the current entry
      recovery_phase: 0..ReadWritePhase,         \* The recovery phases
@@ -169,6 +171,8 @@ InitClient(cid) ==
      confirmed              |-> [id \in EntryIds |-> {}],
      fenced                 |-> {},
      recovery_ensemble      |-> {},
+     recovery_lac           |-> 0,
+     recovery_lafr          |-> 0,
      curr_read_entry        |-> Nil,
      read_responses         |-> {},
      recovery_phase         |-> 0,
@@ -337,13 +341,13 @@ Key points:
   would only need to set it when true.
 ***************************************************************************)
 
-GetAddEntryRequests(c, entry, ensemble, trunc) ==
+GetAddEntryRequests(c, entry, ensemble, recovery, trunc) ==
     { [type     |-> AddEntryRequestMessage,
        bookie   |-> b,
        cid      |-> c.id,
        entry    |-> entry,
-       lac      |-> c.lac,
-       lafr     |-> c.lafr,
+       lac      |-> IF recovery THEN c.recovery_lac ELSE c.lac,
+       lafr     |-> IF recovery THEN c.recovery_lafr ELSE c.lafr,
        term     |-> c.term,
        trunc    |-> trunc] : b \in ensemble }
 
@@ -351,7 +355,7 @@ SendAddEntryRequests(c, entry) ==
     /\ SendMessagesToEnsemble(GetAddEntryRequests(c,
                                                   entry,
                                                   c.curr_fragment.ensemble,
-                                                  FALSE))
+                                                  FALSE, FALSE))
     /\ clients' = [clients EXCEPT ![c.id] =  
                                 [c EXCEPT !.lap = entry.id,
                                           !.pending_add_ops = @ \union 
@@ -677,6 +681,7 @@ ResendPendingAddOp(c, recovery) ==
               /\ SendMessagesToEnsemble(GetAddEntryRequests(c,
                                                             op.entry,
                                                             new_bookies,
+                                                            recovery,
                                                             trunc_flag))
               /\ clients' = [clients EXCEPT ![c.id] = 
                                 [c EXCEPT !.pending_add_ops = SetNewEnsemble(c, op)]]
@@ -795,6 +800,7 @@ GetFencingReadLafrResponseMessage(msg) ==
     [type   |-> FenceResponseMessage,
      bookie |-> msg.bookie,
      cid    |-> msg.cid,
+     lac    |-> b_lac[msg.bookie],
      lafr   |-> b_lafr[msg.bookie],
      term   |-> msg.term,
      code   |-> OK]
@@ -832,14 +838,17 @@ ClientReceivesFencingReadLafrResponse(cid) ==
             /\ ReceivableMessageOfType(messages, msg, FenceResponseMessage)
             /\ msg.term = c.term
             /\ msg.code = OK
-            /\ LET lafr == IF msg.lafr > c.curr_fragment.first_entry_id - 1
+            /\ LET lac  == IF msg.lac > c.curr_fragment.first_entry_id - 1
+                           THEN msg.lac
+                           ELSE c.curr_fragment.first_entry_id - 1
+                   lafr == IF msg.lafr > c.curr_fragment.first_entry_id - 1
                            THEN msg.lafr
                            ELSE c.curr_fragment.first_entry_id - 1
                IN
                 /\ clients' = [clients EXCEPT ![cid] = 
                                     [@ EXCEPT !.fenced = @ \union {msg.bookie},
-                                              !.lafr = IF lafr > @ THEN lafr ELSE @,
-                                              !.lac = IF lafr > @ THEN lafr ELSE @,
+                                              !.recovery_lafr = IF lafr > @ THEN lafr ELSE @,
+                                              !.recovery_lac = IF lac > @ THEN lac ELSE @,
                                               !.lap = IF lafr > @ THEN lafr ELSE @]]
             /\ MessageProcessed(msg)
             /\ UNCHANGED << bookie_vars, meta_vars, sent_values, acked_values >>
@@ -1042,7 +1051,7 @@ NotSentWrite(c, op) ==
         /\ msg.entry = op.entry
         /\ msg.term = c.term
 
-ClientWritesBackEntry(cid) ==
+ClientPerformsRecoveryWrite(cid) ==
     LET c == clients[cid]
     IN
         /\ c.status = STATUS_IN_RECOVERY
@@ -1057,7 +1066,7 @@ ClientWritesBackEntry(cid) ==
                IN SendMessagesToEnsemble(GetAddEntryRequests(c,
                                                              op.entry,
                                                              c.curr_fragment.ensemble,
-                                                             trunc_flag))
+                                                             TRUE, trunc_flag))
         /\ UNCHANGED << bookie_vars, clients, meta_vars, sent_values, acked_values >>
 
 (***************************************************************************
@@ -1093,7 +1102,9 @@ ClientChangesTermToOpen(cid) ==
                                 [c EXCEPT !.status                 = STATUS_OPEN,
                                           !.meta_version           = @ + 1,
                                           !.trunc_entry            = Nil,
-                                          !.recovery_phase         = NotStarted]]
+                                          !.recovery_phase         = NotStarted,
+                                          !.recovery_lac           = 0,
+                                          !.recovery_lafr          = 0]]
         /\ meta_version' = meta_version + 1
         /\ meta_fragments' = c.fragments
         /\ meta_status' = STATUS_OPEN
@@ -1138,7 +1149,7 @@ Next ==
         \/ ClientReceivesFencingReadLafrResponse(cid)
         \/ ClientSendsRecoveryReadRequests(cid)
         \/ ClientReceivesRecoveryReadResponse(cid)
-        \/ ClientWritesBackEntry(cid)
+        \/ ClientPerformsRecoveryWrite(cid)
         \/ RecoveryClientReceivesAddConfirmedResponse(cid)
         \/ RecoveryClientChangesEnsemble(cid)
         \/ RecoveryClientSendsPendingAddOp(cid)
@@ -1313,5 +1324,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Sun Dec 12 13:48:46 CET 2021 by GUNMETAL
+\* Last modified Sun Dec 12 17:17:33 CET 2021 by GUNMETAL
 \* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly
