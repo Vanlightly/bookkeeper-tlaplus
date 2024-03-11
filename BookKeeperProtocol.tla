@@ -483,7 +483,7 @@ ChangeEnsemble(c, recovery) ==
         /\ failed_bookies # {}
         /\ \A bookie \in failed_bookies : WriteTimeoutForBookie(messages, c.id, bookie, recovery)
         /\ LET first_entry_id == c.lac + 1
-               good_bookies   == c.curr_fragment.ensemble \ failed_bookies
+               good_bookies == c.curr_fragment.ensemble \ failed_bookies
            IN
               /\ EnsembleAvailable(good_bookies, failed_bookies)
               /\ \A bookie \in good_bookies : ~WriteTimeoutForBookie(messages, c.id, bookie, recovery)
