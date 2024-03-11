@@ -480,11 +480,14 @@ ChangeEnsemble(c, recovery) ==
     /\ \/ recovery
        \/ ~recovery /\ c.meta_version = meta_version
     /\ \E failed_bookies \in SUBSET c.curr_fragment.ensemble :
+        /\ failed_bookies # {}
         /\ \A bookie \in failed_bookies : WriteTimeoutForBookie(messages, c.id, bookie, recovery)
-        /\ EnsembleAvailable(c.curr_fragment.ensemble \ failed_bookies, failed_bookies)
         /\ LET first_entry_id == c.lac + 1
+               good_bookies == c.curr_fragment.ensemble \ failed_bookies
            IN
-              /\ LET new_ensemble   == SelectEnsemble(c.curr_fragment.ensemble \ failed_bookies, failed_bookies)
+              /\ EnsembleAvailable(good_bookies, failed_bookies)
+              /\ \A bookie \in good_bookies : ~WriteTimeoutForBookie(messages, c.id, bookie, recovery)
+              /\ LET new_ensemble   == SelectEnsemble(good_bookies, failed_bookies)
                      updated_fragments == UpdatedFragments(c, first_entry_id, new_ensemble)
                  IN
                     \* only update the metadata if not in ledger recovery
