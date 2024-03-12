@@ -996,19 +996,33 @@ TypeOK ==
 (***************************************************************************
 Invariant: No Divergence Between Clients And MetaData                   
 
-This invariant is violated if, once a ledger is closed, any client has  
-an entry acknowledged (by AQ bookies) that has a higher entry id than   
+This invariant is violated if, once a ledger is closed, any non-recovery
+client has an entry acknowledged (by AQ bookies) that has a higher entry id than   
 the endpoint of the ledger as stored in the metadata store.             
-This divergence is known as Ledger Truncation and it data loss.                                       
+This divergence is known as Ledger Truncation and it is data loss.
+
+Note that when there are multiple recovery clients, say r1 and r2, 
+it is possible for one client to close the ledger (r1), while the other
+continues to perform recovery (r2), even recovering more than r1. This
+can result in r2, and possible one or more bookies, having an LAC > the 
+last entry of the sealed ledger. This is ok, r2 will not be able to close
+the ledger and the extra entries will exist but never be read. The bookkeeper
+protocol cannot guarantee that entries beyond the end of a seal ledger won't
+be written to bookies, but it does guarantee such entries won't be read.
 ****************************************************************************)
 
 NoDivergenceBetweenClientAndMetaData ==
-    IF meta_status # STATUS_CLOSED
-    THEN TRUE
-    ELSE \A c \in DOMAIN clients :
-            \/ clients[c].status = Nil
-            \/ /\ clients[c].status # Nil
-               /\ \A id \in 1..clients[c].lac : id <= meta_last_entry
+    IF meta_status = STATUS_CLOSED
+    THEN \* exactly one client closed the ledger
+         /\ Quantify(DOMAIN clients, LAMBDA c : 
+                /\ clients[c].status = STATUS_CLOSED
+                /\ clients[c].lac = meta_last_entry) = 1 
+         \* no non-recovery client has an LAC that exceeds the meta_last_entry
+         /\ \A c \in DOMAIN clients :
+            \/ clients[c].status \in { Nil, STATUS_IN_RECOVERY, RECOVERY_ABORTED }
+            \/ /\ clients[c].status \notin { Nil, STATUS_IN_RECOVERY, RECOVERY_ABORTED }
+               /\ clients[c].lac <= meta_last_entry
+    ELSE TRUE
 
 (***************************************************************************
 Invariant: All confirmed entries are readable                           
@@ -1025,28 +1039,6 @@ AllAckedEntriesAreReadable ==
                     \E entry \in b_entries[b] :
                         entry.id = entry_id
         ELSE TRUE
-
-(***************************************************************************
-Invariant: No dirty reads                        
-
-This invariant is violated if a client were allowed to read an entry
-that was not committed. To do that a client would need to read past the LAC.
-That is simple to prevent, the bookie must simply reject any regular
-reads past this point. This spec does not model regular reads.
-
-This invariant instead goes further by checking that the LAC of each bookie
-has indeed reached Ack Quorum and therefore committed.
-****************************************************************************)
-NoDirtyReads ==
-    \A b \in Bookies :
-        \/ b_lac[b] = 0 \* we only care about bookies with LAC > 0
-        \/ /\ b_lac[b] > 0
-           /\ LET ensemble == FragmentOfEntryId(b_lac[b], meta_fragments).ensemble
-              IN
-                \/ b \notin ensemble \* we only care about bookies in the ensemble
-                \/ /\ b \in ensemble
-                   /\ Quantify(ensemble, 
-                        LAMBDA bk : \E e \in b_entries[bk] : e.id = b_lac[b]) >= AckQuorum         
 
 (***************************************************************************
 Invariant: All committed entries reach Ack Quorum                       
@@ -1101,6 +1093,3 @@ Liveness ==
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
-\* Modification History
-\* Last modified Wed Dec 08 17:49:00 CET 2021 by GUNMETAL
-\* Last modified Thu Apr 29 17:55:12 CEST 2021 by jvanlightly

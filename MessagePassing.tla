@@ -139,7 +139,3 @@ IsEarliestMsg(msg) ==
         /\ msg2.bookie = msg.bookie
 
 =============================================================================
-\* Modification History
-\* Last modified Mon Dec 06 10:02:52 CET 2021 by GUNMETAL
-\* Last modified Mon Nov 23 09:37:09 CET 2020 by jvanlightly
-\* Created Mon Nov 23 09:19:26 CET 2020 by jvanlightly
