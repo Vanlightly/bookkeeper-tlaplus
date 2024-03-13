@@ -24,6 +24,8 @@ CONSTANTS Bookies,                      \* The bookies available e.g. { B1, B2, 
                                         \* in order to keep the state space small. E.g 1 or 2
           InflightLimit                 \* Limit the number of unacknowledged add entry requests by the client
                                         \* which can reduce to state space significantly
+BookieSymmetry == Permutations(Bookies)
+ClientSymmetry == Permutations(Clients)
 
 \* Model values
 CONSTANTS Nil,
