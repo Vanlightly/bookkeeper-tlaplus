@@ -849,7 +849,7 @@ RecoveryClientClosesLedger(cid) ==
                                 [c EXCEPT !.status = STATUS_CLOSED,
                                           !.meta_version = @ + 1]]
         /\ meta_version' = meta_version + 1
-        /\ meta_fragments = c.fragments
+        /\ meta_fragments' = c.fragments
         /\ meta_status' = STATUS_CLOSED
         /\ meta_last_entry' = c.lac
         /\ UNCHANGED << bookie_vars, meta_fragments, messages, crashes >>
