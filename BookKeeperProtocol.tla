@@ -132,7 +132,7 @@ InitClient(cid) ==
      recovery_ensemble      |-> {},
      curr_read_entry        |-> Nil,
      read_responses         |-> {},
-     recovery_phase         |-> 0,
+     recovery_phase         |-> NotStarted,
      last_recoverable_entry |-> Nil]
 
 (***************************************************************************)
